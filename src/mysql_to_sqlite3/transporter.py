@@ -669,14 +669,24 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             tables: t.Iterable[RowItemType] = (row[0] for row in self._mysql_cur_prepared.fetchall())
         else:
             # transfer all tables
-            self._mysql_cur.execute(
+            self._mysql_cur_dict.execute(
                 """
                 SELECT TABLE_NAME
                 FROM information_schema.TABLES
-                WHERE TABLE_SCHEMA = SCHEMA()
-            """
+                WHERE TABLE_SCHEMA = %s
+                ORDER BY TABLE_NAME
+                """,
+                (self._mysql_database,)
             )
-            tables = (row[0].decode() for row in self._mysql_cur.fetchall())  # type: ignore[union-attr]
+            all_table_rows = self._mysql_cur_dict.fetchall()
+            tables = []
+            for row in all_table_rows:
+                if row and row.get('TABLE_NAME'):
+                    table_name = row['TABLE_NAME']
+                    if isinstance(table_name, bytes):
+                        table_name = table_name.decode()
+                    tables.append(table_name)
+            self._logger.info(f"Found {len(tables)} tables to transfer")
 
         try:
             # turn off foreign key checking in SQLite while transferring data
@@ -754,3 +764,4 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             self._sqlite_cur.execute("VACUUM")
 
         self._logger.info("Done!")
+        
