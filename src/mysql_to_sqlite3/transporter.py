@@ -506,7 +506,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                         indices += """CREATE {unique} INDEX IF NOT EXISTS "{name}" ON "{table}" ({columns});""".format(
                             unique="UNIQUE" if index["unique"] in {1, "1"} else "",
                             name=(
-                                f"{table_name}_{index_name}"
+                                f"{table_name}_{index_name}_idx"
                                 if (table_collisions > 0 or self._prefix_indices or self._unique_index_names)
                                 else index_name
                             ),
@@ -568,7 +568,17 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
         try:
             if attempting_reconnect:
                 self._mysql.reconnect()
-            self._sqlite_cur.executescript(self._build_create_table_sql(table_name))
+            
+            # Generate the SQL
+            create_sql = self._build_create_table_sql(table_name)
+            
+            # Debug: Log the SQL being executed (only in debug mode)
+            if self._logger.level <= logging.DEBUG:
+                self._logger.debug(f"CREATE TABLE SQL for {table_name}:")
+                self._logger.debug(create_sql)
+            
+            # Execute the SQL
+            self._sqlite_cur.executescript(create_sql)
             self._sqlite.commit()
         except mysql.connector.Error as err:
             if err.errno == errorcode.CR_SERVER_LOST:
@@ -586,6 +596,10 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             raise
         except sqlite3.Error as err:
             self._logger.error("SQLite failed creating table %s: %s", table_name, err)
+            # Also log the SQL that failed in debug mode
+            if self._logger.level <= logging.DEBUG:
+                self._logger.debug("Failed SQL:")
+                self._logger.debug(create_sql)
             raise
 
     def _transfer_table_data(
