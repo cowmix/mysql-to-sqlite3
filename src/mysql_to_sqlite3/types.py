@@ -30,6 +30,7 @@ class MySQLtoSQLiteParams(tx.TypedDict):
     mysql_tables: t.Optional[t.Sequence[str]]
     mysql_user: str
     prefix_indices: t.Optional[bool]
+    unique_index_names: t.Optional[bool]  # again, fixing index creation problems
     quiet: t.Optional[bool]
     sqlite_file: t.Union[str, "os.PathLike[t.Any]"]
     vacuum: t.Optional[bool]
@@ -72,3 +73,4 @@ class MySQLtoSQLiteAttributes:
     _vacuum: bool
     _without_data: bool
     _without_foreign_keys: bool
+    _unique_index_names: bool

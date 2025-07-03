@@ -89,6 +89,8 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             self._collation = CollatingSequences.BINARY
 
         self._prefix_indices = kwargs.get("prefix_indices", False) or False
+        
+        self._unique_index_names = kwargs.get("unique_index_names", False) or False
 
         if bool(self._mysql_tables) or bool(self._exclude_mysql_tables):
             self._without_foreign_keys = True
@@ -505,7 +507,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                             unique="UNIQUE" if index["unique"] in {1, "1"} else "",
                             name=(
                                 f"{table_name}_{index_name}"
-                                if (table_collisions > 0 or self._prefix_indices)
+                                if (table_collisions > 0 or self._prefix_indices or self._unique_index_names)
                                 else index_name
                             ),
                             table=table_name,
@@ -764,4 +766,3 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             self._sqlite_cur.execute("VACUUM")
 
         self._logger.info("Done!")
-        

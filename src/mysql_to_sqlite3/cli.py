@@ -19,6 +19,12 @@ from .sqlite_utils import CollatingSequences
 
 _copyright_header: str = f"mysql2sqlite version {package_version} Copyright (c) 2019-{datetime.now().year} Klemen Tusar"
 
+@click.option(
+    "-U",
+    "--unique-index-names", 
+    is_flag=True,
+    help="Ensure all index names are unique by prefixing them with their table name.",
+)
 
 @click.command(
     name="mysql2sqlite",
@@ -164,6 +170,7 @@ def cli(
     limit_rows: int,
     collation: t.Optional[str],
     prefix_indices: bool,
+    unique_index_names: bool,  # Add this line
     without_foreign_keys: bool,
     without_tables: bool,
     without_data: bool,
@@ -212,6 +219,7 @@ def cli(
             limit_rows=limit_rows,
             collation=collation,
             prefix_indices=prefix_indices,
+            unique_index_names=unique_index_names,  # Add this line
             without_foreign_keys=without_foreign_keys or (mysql_tables is not None and len(mysql_tables) > 0),
             without_tables=without_tables,
             without_data=without_data,
