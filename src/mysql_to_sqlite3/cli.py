@@ -219,7 +219,7 @@ def cli(
             limit_rows=limit_rows,
             collation=collation,
             prefix_indices=prefix_indices,
-            unique_index_names=unique_index_names,  # Add this line
+            unique_index_names=unique_index_names,  # No more index name conflicts
             without_foreign_keys=without_foreign_keys or (mysql_tables is not None and len(mysql_tables) > 0),
             without_tables=without_tables,
             without_data=without_data,
