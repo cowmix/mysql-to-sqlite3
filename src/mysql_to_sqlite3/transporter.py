@@ -6,11 +6,14 @@ import re
 import sqlite3
 import typing as t
 import fnmatch
+import time
+from contextlib import contextmanager
 from datetime import timedelta
 from decimal import Decimal
 from math import ceil
 from os.path import realpath
 from sys import stdout
+from typing import Iterator, List, Tuple, Any
 
 import mysql.connector
 import typing_extensions as tx
@@ -120,6 +123,32 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         self._logger = self._setup_logger(log_file=kwargs.get("log_file") or None, quiet=self._quiet)
 
+        # MySQL connection configuration for large transfers
+        self._mysql_connection_config = {
+            'user': self._mysql_user,
+            'password': self._mysql_password,
+            'host': self._mysql_host,
+            'port': self._mysql_port,
+            'database': self._mysql_database,
+            'ssl_disabled': self._mysql_ssl_disabled,
+            'charset': self._mysql_charset,
+            'collation': self._mysql_collation,
+            'autocommit': True,
+            'connection_timeout': 300,  # 5 minutes
+            'use_unicode': True,
+            'sql_mode': 'TRADITIONAL',
+            'reconnect': True,  # Enable automatic reconnection
+            'consume_results': True,  # Consume any pending results
+            # Increase timeouts for large transfers
+            'init_command': (
+                "SET SESSION wait_timeout=86400, "
+                "interactive_timeout=86400, "
+                "net_read_timeout=600, "
+                "net_write_timeout=600, "
+                "max_allowed_packet=1073741824"  # 1GB
+            )
+        }
+
         sqlite3.register_adapter(Decimal, adapt_decimal)
         sqlite3.register_converter("DECIMAL", convert_decimal)
         sqlite3.register_adapter(timedelta, adapt_timedelta)
@@ -135,40 +164,129 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         self._sqlite_json1_extension_enabled = not self._json_as_text and self._check_sqlite_json1_extension_enabled()
 
+        # Initial MySQL connection
+        self._connect_to_mysql()
+
+    def _connect_to_mysql(self) -> None:
+        """Establish MySQL connection with proper configuration."""
         try:
-            _mysql_connection = mysql.connector.connect(
-                user=self._mysql_user,
-                password=self._mysql_password,
-                host=self._mysql_host,
-                port=self._mysql_port,
-                ssl_disabled=self._mysql_ssl_disabled,
-                charset=self._mysql_charset,
-                collation=self._mysql_collation,
-            )
+            # Close existing connection if it exists
+            if hasattr(self, '_mysql') and self._mysql:
+                try:
+                    self._mysql.close()
+                except:
+                    pass  # Ignore errors when closing broken connections
+            
+            _mysql_connection = mysql.connector.connect(**self._mysql_connection_config)
             if isinstance(_mysql_connection, MySQLConnectionAbstract):
                 self._mysql = _mysql_connection
             else:
                 raise ConnectionError("Unable to connect to MySQL")
+            
             if not self._mysql.is_connected():
                 raise ConnectionError("Unable to connect to MySQL")
 
-            self._mysql_cur = self._mysql.cursor(buffered=self._buffered, raw=True)  # type: ignore[assignment]
-            self._mysql_cur_prepared = self._mysql.cursor(prepared=True)  # type: ignore[assignment]
-            self._mysql_cur_dict = self._mysql.cursor(  # type: ignore[assignment]
-                buffered=self._buffered,
-                dictionary=True,
-            )
-            try:
-                self._mysql.database = self._mysql_database
-            except (mysql.connector.Error, Exception) as err:
-                if hasattr(err, "errno") and err.errno == errorcode.ER_BAD_DB_ERROR:
-                    self._logger.error("MySQL Database does not exist!")
-                    raise
-                self._logger.error(err)
-                raise
+            # Create cursors with appropriate settings - always create fresh cursors
+            self._mysql_cur = self._mysql.cursor(buffered=False, raw=True)  # Unbuffered for large results
+            self._mysql_cur_prepared = self._mysql.cursor(prepared=True)
+            self._mysql_cur_dict = self._mysql.cursor(buffered=True, dictionary=True)  # Buffered for metadata
+            
+            self._logger.debug("MySQL connection established successfully")
+            
         except mysql.connector.Error as err:
-            self._logger.error(err)
+            self._logger.error("Failed to connect to MySQL: %s", err)
             raise
+
+    @contextmanager
+    def _mysql_connection_manager(self, cursor_type: str = 'raw') -> Iterator[Any]:
+        """Context manager for MySQL operations with automatic reconnection."""
+        max_retries = 3
+        retry_delay = 5
+        
+        for attempt in range(max_retries):
+            try:
+                # Check connection health and handle various disconnection scenarios
+                connection_lost = False
+                try:
+                    if not self._mysql.is_connected():
+                        connection_lost = True
+                    else:
+                        # Additional check: try a simple ping
+                        self._mysql.ping(reconnect=False, attempts=1)
+                except (mysql.connector.Error, mysql.connector.OperationalError, mysql.connector.InterfaceError):
+                    connection_lost = True
+                
+                if connection_lost:
+                    self._logger.warning("MySQL connection lost, reconnecting...")
+                    self._connect_to_mysql()
+                
+                # Get appropriate cursor - recreate cursors after reconnection
+                if cursor_type == 'dict':
+                    cursor = self._mysql_cur_dict
+                elif cursor_type == 'prepared':
+                    cursor = self._mysql_cur_prepared
+                else:
+                    cursor = self._mysql_cur
+                
+                yield cursor
+                break  # Success, exit retry loop
+                
+            except (
+                mysql.connector.Error, 
+                mysql.connector.OperationalError, 
+                mysql.connector.InterfaceError,
+                mysql.connector.DatabaseError
+            ) as err:
+                # Check for specific connection reset errors
+                connection_reset_errors = [
+                    errorcode.CR_SERVER_LOST,
+                    errorcode.CR_SERVER_GONE_ERROR,
+                    errorcode.CR_CONNECTION_ERROR,
+                    errorcode.ER_SERVER_SHUTDOWN,
+                    2013,  # Lost connection to MySQL server during query
+                    2006,  # MySQL server has gone away
+                    2055,  # Lost connection to MySQL server at 'reading initial communication packet'
+                ]
+                
+                is_connection_error = (
+                    hasattr(err, 'errno') and err.errno in connection_reset_errors
+                ) or (
+                    "Lost connection" in str(err) or 
+                    "MySQL server has gone away" in str(err) or
+                    "Connection reset by peer" in str(err) or
+                    "Broken pipe" in str(err) or
+                    "Can't connect to MySQL server" in str(err)
+                )
+                
+                if attempt < max_retries - 1:
+                    if is_connection_error:
+                        self._logger.warning(
+                            "MySQL connection reset detected (attempt %d/%d): %s. Reconnecting in %d seconds...",
+                            attempt + 1, max_retries, err, retry_delay
+                        )
+                    else:
+                        self._logger.warning(
+                            "MySQL operation failed (attempt %d/%d): %s. Retrying in %d seconds...",
+                            attempt + 1, max_retries, err, retry_delay
+                        )
+                    
+                    time.sleep(retry_delay)
+                    
+                    # Force reconnection for connection errors
+                    try:
+                        if hasattr(self, '_mysql') and self._mysql:
+                            try:
+                                self._mysql.close()
+                            except:
+                                pass  # Ignore errors when closing broken connection
+                        self._connect_to_mysql()
+                    except Exception as reconnect_err:
+                        self._logger.warning("Reconnection failed: %s", reconnect_err)
+                        # Increase retry delay exponentially for failed reconnections
+                        retry_delay = min(retry_delay * 2, 60)
+                else:
+                    self._logger.error("MySQL operation failed after %d attempts: %s", max_retries, err)
+                    raise
 
     @classmethod
     def _setup_logger(
@@ -403,8 +521,9 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
         primary: str = ""
         indices: str = ""
 
-        self._mysql_cur_dict.execute(f"SHOW COLUMNS FROM `{table_name}`")
-        rows: t.Sequence[t.Optional[t.Dict[str, RowItemType]]] = self._mysql_cur_dict.fetchall()
+        with self._mysql_connection_manager('dict') as cursor:
+            cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+            rows: t.Sequence[t.Optional[t.Dict[str, RowItemType]]] = cursor.fetchall()
 
         primary_keys: int = sum(1 for row in rows if row is not None and row["Key"] == "PRI")
 
@@ -434,33 +553,35 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                         collation=self._data_type_collation_sequence(self._collation, column_type),
                     )
 
-        self._mysql_cur_dict.execute(
-            """
-            SELECT s.INDEX_NAME AS `name`,
-                IF (NON_UNIQUE = 0 AND s.INDEX_NAME = 'PRIMARY', 1, 0) AS `primary`,
-                IF (NON_UNIQUE = 0 AND s.INDEX_NAME <> 'PRIMARY', 1, 0) AS `unique`,
-                {auto_increment}
-                GROUP_CONCAT(s.COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS `columns`,
-                GROUP_CONCAT(c.COLUMN_TYPE ORDER BY SEQ_IN_INDEX) AS `types`
-            FROM information_schema.STATISTICS AS s
-            JOIN information_schema.COLUMNS AS c
-                ON s.TABLE_SCHEMA = c.TABLE_SCHEMA
-                AND s.TABLE_NAME = c.TABLE_NAME
-                AND s.COLUMN_NAME = c.COLUMN_NAME
-            WHERE s.TABLE_SCHEMA = %s
-            AND s.TABLE_NAME = %s
-            GROUP BY s.INDEX_NAME, s.NON_UNIQUE {group_by_extra}
-            """.format(
-                auto_increment=(
-                    "IF (c.EXTRA = 'auto_increment', 1, 0) AS `auto_increment`,"
-                    if primary_keys == 1
-                    else "0 as `auto_increment`,"
+        with self._mysql_connection_manager('dict') as cursor:
+            cursor.execute(
+                """
+                SELECT s.INDEX_NAME AS `name`,
+                    IF (NON_UNIQUE = 0 AND s.INDEX_NAME = 'PRIMARY', 1, 0) AS `primary`,
+                    IF (NON_UNIQUE = 0 AND s.INDEX_NAME <> 'PRIMARY', 1, 0) AS `unique`,
+                    {auto_increment}
+                    GROUP_CONCAT(s.COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS `columns`,
+                    GROUP_CONCAT(c.COLUMN_TYPE ORDER BY SEQ_IN_INDEX) AS `types`
+                FROM information_schema.STATISTICS AS s
+                JOIN information_schema.COLUMNS AS c
+                    ON s.TABLE_SCHEMA = c.TABLE_SCHEMA
+                    AND s.TABLE_NAME = c.TABLE_NAME
+                    AND s.COLUMN_NAME = c.COLUMN_NAME
+                WHERE s.TABLE_SCHEMA = %s
+                AND s.TABLE_NAME = %s
+                GROUP BY s.INDEX_NAME, s.NON_UNIQUE {group_by_extra}
+                """.format(
+                    auto_increment=(
+                        "IF (c.EXTRA = 'auto_increment', 1, 0) AS `auto_increment`,"
+                        if primary_keys == 1
+                        else "0 as `auto_increment`,"
+                    ),
+                    group_by_extra=" ,c.EXTRA" if primary_keys == 1 else "",
                 ),
-                group_by_extra=" ,c.EXTRA" if primary_keys == 1 else "",
-            ),
-            (self._mysql_database, table_name),
-        )
-        mysql_indices: t.Sequence[t.Optional[t.Dict[str, RowItemType]]] = self._mysql_cur_dict.fetchall()
+                (self._mysql_database, table_name),
+            )
+            mysql_indices: t.Sequence[t.Optional[t.Dict[str, RowItemType]]] = cursor.fetchall()
+
         for index in mysql_indices:
             if index is not None:
                 index_name: str
@@ -472,16 +593,18 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                     index_name = str(index["name"])
 
                 # check if the index name collides with any table name
-                self._mysql_cur_dict.execute(
-                    """
-                    SELECT COUNT(*) AS `count`
-                    FROM information_schema.TABLES
-                    WHERE TABLE_SCHEMA = %s
-                    AND TABLE_NAME = %s
-                    """,
-                    (self._mysql_database, index_name),
-                )
-                collision: t.Optional[t.Dict[str, RowItemType]] = self._mysql_cur_dict.fetchone()
+                with self._mysql_connection_manager('dict') as cursor:
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*) AS `count`
+                        FROM information_schema.TABLES
+                        WHERE TABLE_SCHEMA = %s
+                        AND TABLE_NAME = %s
+                        """,
+                        (self._mysql_database, index_name),
+                    )
+                    collision: t.Optional[t.Dict[str, RowItemType]] = cursor.fetchone()
+
                 table_collisions: int = 0
                 if collision is not None:
                     table_collisions = int(collision["count"])  # type: ignore[arg-type]
@@ -528,39 +651,40 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         if not self._without_tables and not self._without_foreign_keys:
             server_version: t.Optional[t.Tuple[int, ...]] = self._mysql.get_server_version()
-            self._mysql_cur_dict.execute(
-                """
-                SELECT k.COLUMN_NAME AS `column`,
-                       k.REFERENCED_TABLE_NAME AS `ref_table`,
-                       k.REFERENCED_COLUMN_NAME AS `ref_column`,
-                       c.UPDATE_RULE AS `on_update`,
-                       c.DELETE_RULE AS `on_delete`
-                FROM information_schema.TABLE_CONSTRAINTS AS i
-                {JOIN} information_schema.KEY_COLUMN_USAGE AS k
-                    ON i.CONSTRAINT_NAME = k.CONSTRAINT_NAME
-                    AND i.TABLE_NAME = k.TABLE_NAME
-                {JOIN} information_schema.REFERENTIAL_CONSTRAINTS AS c
-                    ON c.CONSTRAINT_NAME = i.CONSTRAINT_NAME
-                    AND c.TABLE_NAME = i.TABLE_NAME
-                WHERE i.TABLE_SCHEMA = %s
-                AND i.TABLE_NAME = %s
-                AND i.CONSTRAINT_TYPE = %s
-                """.format(
-                    JOIN=(
-                        "JOIN"
-                        if (server_version is not None and server_version[0] == 8 and server_version[2] > 19)
-                        else "LEFT JOIN"
-                    )
-                ),
-                (self._mysql_database, table_name, "FOREIGN KEY"),
-            )
-            for foreign_key in self._mysql_cur_dict.fetchall():
-                if foreign_key is not None:
-                    sql += (
-                        ',\n\tFOREIGN KEY("{column}") REFERENCES "{ref_table}" ("{ref_column}") '
-                        "ON UPDATE {on_update} "
-                        "ON DELETE {on_delete}".format(**foreign_key)  # type: ignore[str-bytes-safe]
-                    )
+            with self._mysql_connection_manager('dict') as cursor:
+                cursor.execute(
+                    """
+                    SELECT k.COLUMN_NAME AS `column`,
+                           k.REFERENCED_TABLE_NAME AS `ref_table`,
+                           k.REFERENCED_COLUMN_NAME AS `ref_column`,
+                           c.UPDATE_RULE AS `on_update`,
+                           c.DELETE_RULE AS `on_delete`
+                    FROM information_schema.TABLE_CONSTRAINTS AS i
+                    {JOIN} information_schema.KEY_COLUMN_USAGE AS k
+                        ON i.CONSTRAINT_NAME = k.CONSTRAINT_NAME
+                        AND i.TABLE_NAME = k.TABLE_NAME
+                    {JOIN} information_schema.REFERENTIAL_CONSTRAINTS AS c
+                        ON c.CONSTRAINT_NAME = i.CONSTRAINT_NAME
+                        AND c.TABLE_NAME = i.TABLE_NAME
+                    WHERE i.TABLE_SCHEMA = %s
+                    AND i.TABLE_NAME = %s
+                    AND i.CONSTRAINT_TYPE = %s
+                    """.format(
+                        JOIN=(
+                            "JOIN"
+                            if (server_version is not None and server_version[0] == 8 and server_version[2] > 19)
+                            else "LEFT JOIN"
+                        )
+                    ),
+                    (self._mysql_database, table_name, "FOREIGN KEY"),
+                )
+                for foreign_key in cursor.fetchall():
+                    if foreign_key is not None:
+                        sql += (
+                            ',\n\tFOREIGN KEY("{column}") REFERENCES "{ref_table}" ("{ref_column}") '
+                            "ON UPDATE {on_update} "
+                            "ON DELETE {on_delete}".format(**foreign_key)  # type: ignore[str-bytes-safe]
+                        )
 
         sql += "\n);"
         sql += indices
@@ -568,63 +692,111 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
         return sql
 
     def _create_table(self, table_name: str) -> None:
+        """Create table with connection management."""
         try:
-            self._mysql.ping(reconnect=True, attempts=3, delay=5)
-            self._sqlite_cur.executescript(self._build_create_table_sql(table_name))
+            sql_script = self._build_create_table_sql(table_name)
+            self._sqlite_cur.executescript(sql_script)
             self._sqlite.commit()
+                
         except mysql.connector.Error as err:
             self._logger.error(
                 "MySQL failed reading table definition from table %s: %s",
-                table_name,
-                err,
+                table_name, err
             )
             raise
         except sqlite3.Error as err:
             self._logger.error("SQLite failed creating table %s: %s", table_name, err)
             raise
 
-    def _transfer_table_data(self, table_name: str, sql: str, total_records: int = 0) -> None:
-        try:
-            if self._chunk_size is not None and self._chunk_size > 0:
-                for _ in trange(
-                    0,
-                    int(ceil(total_records / self._chunk_size)),
-                    disable=self._quiet,
-                ):
-                    self._mysql.ping(reconnect=True, attempts=3, delay=5)
-                    self._sqlite_cur.executemany(
-                        sql,
-                        (
-                            tuple(encode_data_for_sqlite(col) if col is not None else None for col in row)
-                            for row in self._mysql_cur.fetchmany(self._chunk_size)
-                        ),
+    def _chunked_data_iterator(self, table_name: str, total_records: int) -> Iterator[List[Tuple[Any, ...]]]:
+        """Iterator that yields data chunks with proper connection management."""
+        if self._chunk_size is None or self._chunk_size <= 0:
+            # Non-chunked: fetch all at once
+            with self._mysql_connection_manager('raw') as cursor:
+                cursor.execute(
+                    "SELECT * FROM `{table_name}` {limit}".format(
+                        table_name=table_name,
+                        limit=f"LIMIT {self._limit_rows}" if self._limit_rows > 0 else "",
                     )
-            else:
-                self._mysql.ping(reconnect=True, attempts=3, delay=5)
-                self._sqlite_cur.executemany(
-                    sql,
-                    (
-                        tuple(encode_data_for_sqlite(col) if col is not None else None for col in row)
-                        for row in tqdm(
-                            self._mysql_cur.fetchall(),
-                            total=total_records,
-                            disable=self._quiet,
-                        )
-                    ),
                 )
-            self._sqlite.commit()
+                
+                # Fetch in reasonable chunks to avoid memory issues
+                chunk_size = min(50000, total_records) if total_records > 0 else 50000
+                
+                while True:
+                    chunk = cursor.fetchmany(chunk_size)
+                    if not chunk:
+                        break
+                    yield [
+                        tuple(encode_data_for_sqlite(col) if col is not None else None for col in row)
+                        for row in chunk
+                    ]
+        else:
+            # Chunked transfer using LIMIT/OFFSET
+            offset = 0
+            
+            while offset < total_records:
+                with self._mysql_connection_manager('raw') as cursor:
+                    limit_clause = f"LIMIT {self._chunk_size} OFFSET {offset}"
+                    if self._limit_rows > 0:
+                        remaining = min(self._limit_rows - offset, self._chunk_size)
+                        if remaining <= 0:
+                            break
+                        limit_clause = f"LIMIT {remaining} OFFSET {offset}"
+                    
+                    cursor.execute(f"SELECT * FROM `{table_name}` {limit_clause}")
+                    chunk = cursor.fetchall()
+                    
+                    if not chunk:
+                        break
+                    
+                    yield [
+                        tuple(encode_data_for_sqlite(col) if col is not None else None for col in row)
+                        for row in chunk
+                    ]
+                    
+                    offset += len(chunk)
+
+    def _transfer_table_data(self, table_name: str, sql: str, total_records: int = 0) -> None:
+        """Transfer table data with robust connection handling."""
+        try:
+            if total_records == 0:
+                return
+            
+            # Calculate progress tracking
+            if self._chunk_size and self._chunk_size > 0:
+                total_chunks = int(ceil(total_records / self._chunk_size))
+                progress_bar = trange(total_chunks, disable=self._quiet, desc=f"Transferring {table_name}")
+            else:
+                progress_bar = trange(1, disable=self._quiet, desc=f"Transferring {table_name}")
+            
+            # Process data in chunks
+            for chunk_data in self._chunked_data_iterator(table_name, total_records):
+                if not chunk_data:
+                    break
+                
+                # Insert chunk into SQLite
+                self._sqlite_cur.executemany(sql, chunk_data)
+                
+                # Commit periodically to avoid large transactions
+                self._sqlite.commit()
+                
+                # Update progress
+                if not self._quiet:
+                    progress_bar.update(1)
+            
+            progress_bar.close()
+            
         except mysql.connector.Error as err:
             self._logger.error(
                 "MySQL transfer failed reading table data from table %s: %s",
-                table_name,
-                err,
+                table_name, err
             )
             raise
         except sqlite3.Error as err:
             self._logger.error(
                 "SQLite transfer failed inserting data into table %s: %s",
-                table_name,
-                err,
+                table_name, err
             )
             raise
 
@@ -651,30 +823,40 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
         if self._min_rows_to_export > 0:
             filtered_tables = []
             for table in tables_to_transfer:
-                self._mysql_cur_dict.execute(f"SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{self._mysql_database}' AND TABLE_NAME = '{table}'")
-                row_count = self._mysql_cur_dict.fetchone()
-                if row_count and row_count['TABLE_ROWS'] >= self._min_rows_to_export:
-                    filtered_tables.append(table)
+                with self._mysql_connection_manager('dict') as cursor:
+                    cursor.execute(
+                        f"SELECT TABLE_ROWS FROM information_schema.TABLES "
+                        f"WHERE TABLE_SCHEMA = '{self._mysql_database}' AND TABLE_NAME = '{table}'"
+                    )
+                    row_count = cursor.fetchone()
+                    if row_count and row_count['TABLE_ROWS'] >= self._min_rows_to_export:
+                        filtered_tables.append(table)
             return filtered_tables
         
         return tables_to_transfer
 
-    def transfer(self) -> None:""
-
     def transfer(self) -> None:
-        """The primary and only method with which we transfer all the data."""
+        """The primary transfer method with robust error handling."""
         tables = self._get_tables_to_transfer()
 
         try:
-            # turn off foreign key checking in SQLite while transferring data
+            # Turn off foreign key checking in SQLite while transferring data
             self._sqlite_cur.execute("PRAGMA foreign_keys=OFF")
-
+            
+            # Optimize SQLite for bulk inserts
+            self._sqlite_cur.execute("PRAGMA synchronous=OFF")
+            self._sqlite_cur.execute("PRAGMA journal_mode=MEMORY")
+            self._sqlite_cur.execute("PRAGMA cache_size=1000000")
+            
             for table_name in tables:
                 if isinstance(table_name, bytes):
                     table_name = table_name.decode()
 
                 if self._skip_existing_tables:
-                    self._sqlite_cur.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+                    self._sqlite_cur.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", 
+                        (table_name,)
+                    )
                     if self._sqlite_cur.fetchone():
                         self._logger.info(f"Skipping existing table: {table_name}")
                         continue
@@ -686,42 +868,30 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                     table_name,
                 )
 
-                # reset the chunk
-                self._current_chunk_number = 0
-
                 if not self._without_tables:
-                    # create the table
-                    self._create_table(table_name)  # type: ignore[arg-type]
+                    self._create_table(table_name)
 
                 if not self._without_data:
-                    # get the size of the data
-                    if self._limit_rows > 0:
-                        # limit to the requested number of rows
-                        self._mysql_cur_dict.execute(
-                            "SELECT COUNT(*) AS `total_records` "
-                            f"FROM (SELECT * FROM `{table_name}` LIMIT {self._limit_rows}) AS `table`"
-                        )
-                    else:
-                        # get all rows
-                        self._mysql_cur_dict.execute(f"SELECT COUNT(*) AS `total_records` FROM `{table_name}`")
-
-                    total_records: t.Optional[t.Dict[str, RowItemType]] = self._mysql_cur_dict.fetchone()
-                    if total_records is not None:
-                        total_records_count: int = int(total_records["total_records"])  # type: ignore[arg-type]
-                    else:
-                        total_records_count = 0
-
-                    # only continue if there is anything to transfer
-                    if total_records_count > 0:
-                        # populate it
-                        self._mysql_cur.execute(
-                            "SELECT * FROM `{table_name}` {limit}".format(
-                                table_name=table_name,
-                                limit=f"LIMIT {self._limit_rows}" if self._limit_rows > 0 else "",
+                    # Get total record count
+                    with self._mysql_connection_manager('dict') as cursor:
+                        if self._limit_rows > 0:
+                            cursor.execute(
+                                f"SELECT COUNT(*) AS `total_records` "
+                                f"FROM (SELECT * FROM `{table_name}` LIMIT {self._limit_rows}) AS `table`"
                             )
-                        )
-                        columns: t.Tuple[str, ...] = tuple(column[0] for column in self._mysql_cur.description)  # type: ignore[union-attr]
-                        # build the SQL string
+                        else:
+                            cursor.execute(f"SELECT COUNT(*) AS `total_records` FROM `{table_name}`")
+                        
+                        result = cursor.fetchone()
+                        total_records_count = int(result["total_records"]) if result else 0
+
+                    if total_records_count > 0:
+                        # Get column information for building SQL
+                        with self._mysql_connection_manager('raw') as cursor:
+                            cursor.execute(f"SELECT * FROM `{table_name}` LIMIT 0")
+                            columns = tuple(column[0] for column in cursor.description)
+                        
+                        # Build SQL for insertion
                         sql = """
                             INSERT OR IGNORE
                             INTO "{table}" ({fields})
@@ -731,15 +901,19 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                             fields=('"{}", ' * len(columns)).rstrip(" ,").format(*columns),
                             placeholders=("?, " * len(columns)).rstrip(" ,"),
                         )
+                        
                         self._transfer_table_data(
-                            table_name=table_name,  # type: ignore[arg-type]
+                            table_name=table_name,
                             sql=sql,
                             total_records=total_records_count,
                         )
-        except Exception:  # pylint: disable=W0706
+
+        except Exception:
             raise
         finally:
-            # re-enable foreign key checking once done transferring
+            # Restore SQLite settings
+            self._sqlite_cur.execute("PRAGMA synchronous=FULL")
+            self._sqlite_cur.execute("PRAGMA journal_mode=DELETE")
             self._sqlite_cur.execute("PRAGMA foreign_keys=ON")
 
         if self._vacuum:
@@ -748,5 +922,6 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         self._logger.info("Done!")
 
-        self._mysql.close()
+        if self._mysql.is_connected():
+            self._mysql.close()
         self._sqlite.close()
