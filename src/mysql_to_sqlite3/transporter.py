@@ -567,20 +567,12 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         return sql
 
-    def _create_table(self, table_name: str, attempting_reconnect: bool = False) -> None:
+    def _create_table(self, table_name: str) -> None:
         try:
-            if attempting_reconnect:
-                self._mysql.reconnect()
+            self._mysql.ping(reconnect=True, attempts=3, delay=5)
             self._sqlite_cur.executescript(self._build_create_table_sql(table_name))
             self._sqlite.commit()
         except mysql.connector.Error as err:
-            if err.errno == errorcode.CR_SERVER_LOST:
-                if not attempting_reconnect:
-                    self._logger.warning("Connection to MySQL server lost.\nAttempting to reconnect.")
-                    self._create_table(table_name, True)
-                else:
-                    self._logger.warning("Connection to MySQL server lost.\nReconnection attempt aborted.")
-                    raise
             self._logger.error(
                 "MySQL failed reading table definition from table %s: %s",
                 table_name,
@@ -591,19 +583,15 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             self._logger.error("SQLite failed creating table %s: %s", table_name, err)
             raise
 
-    def _transfer_table_data(
-        self, table_name: str, sql: str, total_records: int = 0, attempting_reconnect: bool = False
-    ) -> None:
-        if attempting_reconnect:
-            self._mysql.reconnect()
+    def _transfer_table_data(self, table_name: str, sql: str, total_records: int = 0) -> None:
         try:
             if self._chunk_size is not None and self._chunk_size > 0:
-                for chunk in trange(
-                    self._current_chunk_number,
+                for _ in trange(
+                    0,
                     int(ceil(total_records / self._chunk_size)),
                     disable=self._quiet,
                 ):
-                    self._current_chunk_number = chunk
+                    self._mysql.ping(reconnect=True, attempts=3, delay=5)
                     self._sqlite_cur.executemany(
                         sql,
                         (
@@ -612,6 +600,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                         ),
                     )
             else:
+                self._mysql.ping(reconnect=True, attempts=3, delay=5)
                 self._sqlite_cur.executemany(
                     sql,
                     (
@@ -625,18 +614,6 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                 )
             self._sqlite.commit()
         except mysql.connector.Error as err:
-            if err.errno == errorcode.CR_SERVER_LOST:
-                if not attempting_reconnect:
-                    self._logger.warning("Connection to MySQL server lost.\nAttempting to reconnect.")
-                    self._transfer_table_data(
-                        table_name=table_name,
-                        sql=sql,
-                        total_records=total_records,
-                        attempting_reconnect=True,
-                    )
-                else:
-                    self._logger.warning("Connection to MySQL server lost.\nReconnection attempt aborted.")
-                    raise
             self._logger.error(
                 "MySQL transfer failed reading table data from table %s: %s",
                 table_name,
