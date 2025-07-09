@@ -79,6 +79,8 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         self._limit_rows = kwargs.get("limit_rows", 0) or 0
 
+        self._min_rows_to_export = kwargs.get("min_rows_to_export", 0) or 0
+
         if kwargs.get("collation") is not None and str(kwargs.get("collation")).upper() in {
             CollatingSequences.BINARY,
             CollatingSequences.NOCASE,
@@ -684,7 +686,18 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             )
             tables = [row[0].decode() if isinstance(row[0], bytes) else row[0] for row in self._mysql_cur.fetchall()]
         
+        if self._min_rows_to_export > 0:
+            tables_to_transfer = []
+            for table in tables:
+                self._mysql_cur_dict.execute(f"SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{self._mysql_database}' AND TABLE_NAME = '{table}'")
+                row_count = self._mysql_cur_dict.fetchone()
+                if row_count and row_count['TABLE_ROWS'] >= self._min_rows_to_export:
+                    tables_to_transfer.append(table)
+            return tables_to_transfer
+        
         return tables
+
+    def transfer(self) -> None:""
 
     def transfer(self) -> None:
         """The primary and only method with which we transfer all the data."""

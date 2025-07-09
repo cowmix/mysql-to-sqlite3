@@ -73,6 +73,14 @@ _copyright_header: str = f"mysql2sqlite version {package_version} Copyright (c) 
     help="Transfer only a limited number of rows from each table.",
 )
 @click.option(
+    "-M",
+    "--min-rows-to-export",
+    type=int,
+    callback=validate_positive_integer,
+    default=0,
+    help="Exclude exporting tables with a row count below this threshold.",
+)
+@click.option(
     "-C",
     "--collation",
     type=click.Choice(
@@ -170,6 +178,7 @@ def cli(
     mysql_tables: t.Optional[t.Sequence[str]],
     exclude_mysql_tables: t.Optional[t.Sequence[str]],
     limit_rows: int,
+    min_rows_to_export: int,
     collation: t.Optional[str],
     prefix_indices: bool,
     without_foreign_keys: bool,
@@ -221,6 +230,7 @@ def cli(
                 mysql_database=mysql_database,
                 mysql_tables=mysql_tables,
                 exclude_mysql_tables=exclude_mysql_tables,
+                min_rows_to_export=min_rows_to_export,
                 mysql_host=mysql_host,
                 mysql_port=mysql_port,
                 mysql_charset=mysql_charset,
@@ -252,6 +262,7 @@ def cli(
                     mysql_tables=[table_name],  # Transfer only this table
                     exclude_mysql_tables=None,
                     limit_rows=limit_rows,
+                    min_rows_to_export=min_rows_to_export,
                     collation=collation,
                     prefix_indices=prefix_indices,
                     without_foreign_keys=True,  # Foreign keys don't make sense across separate files
@@ -282,6 +293,7 @@ def cli(
                 mysql_tables=mysql_tables,
                 exclude_mysql_tables=exclude_mysql_tables,
                 limit_rows=limit_rows,
+                min_rows_to_export=min_rows_to_export,
                 collation=collation,
                 prefix_indices=prefix_indices,
                 without_foreign_keys=without_foreign_keys or (mysql_tables is not None and len(mysql_tables) > 0),

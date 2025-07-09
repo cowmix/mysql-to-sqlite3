@@ -19,6 +19,7 @@ class MySQLtoSQLiteParams(tx.TypedDict):
     exclude_mysql_tables: t.Optional[t.Sequence[str]]
     json_as_text: t.Optional[bool]
     limit_rows: t.Optional[int]
+    min_rows_to_export: t.Optional[int]
     log_file: t.Optional[t.Union[str, "os.PathLike[t.Any]"]]
     mysql_database: str
     mysql_host: str
