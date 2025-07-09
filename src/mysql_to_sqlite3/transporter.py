@@ -164,7 +164,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
         # Initial MySQL connection
         self._connect_to_mysql()
 
-    def _connect_to_mysql(self) -> None:
+    def _connect_to_mysql(self, is_reconnect: bool = False) -> None:
         """Establish MySQL connection with proper configuration."""
         try:
             # Close existing connection if it exists
@@ -188,7 +188,12 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             self._mysql_cur_prepared = self._mysql.cursor(prepared=True)
             self._mysql_cur_dict = self._mysql.cursor(buffered=True, dictionary=True)  # Buffered for metadata
             
-            self._logger.debug("MySQL connection established successfully")
+            # Only log when it's an initial connection or a reconnection
+            if is_reconnect:
+                self._logger.info("MySQL connection re-established successfully")
+            elif not hasattr(self, '_initial_connection_logged'):
+                self._logger.info("MySQL connection established successfully")
+                self._initial_connection_logged = True
             
         except mysql.connector.Error as err:
             self._logger.error("Failed to connect to MySQL: %s", err)
@@ -208,14 +213,14 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                     if not self._mysql.is_connected():
                         connection_lost = True
                     else:
-                        # Additional check: try a simple ping
+                        # Additional check: try a simple ping (but don't log every ping)
                         self._mysql.ping(reconnect=False, attempts=1)
                 except (mysql.connector.Error, mysql.connector.OperationalError, mysql.connector.InterfaceError):
                     connection_lost = True
                 
                 if connection_lost:
                     self._logger.warning("MySQL connection lost, reconnecting...")
-                    self._connect_to_mysql()
+                    self._connect_to_mysql(is_reconnect=True)
                 
                 # Get appropriate cursor - recreate cursors after reconnection
                 if cursor_type == 'dict':
@@ -276,7 +281,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                                 self._mysql.close()
                             except:
                                 pass  # Ignore errors when closing broken connection
-                        self._connect_to_mysql()
+                        self._connect_to_mysql(is_reconnect=True)
                     except Exception as reconnect_err:
                         self._logger.warning("Reconnection failed: %s", reconnect_err)
                         # Increase retry delay exponentially for failed reconnections
