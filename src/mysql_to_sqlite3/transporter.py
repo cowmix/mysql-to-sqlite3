@@ -114,6 +114,8 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         self._vacuum = bool(kwargs.get("vacuum", False))
 
+        self._skip_existing_tables = bool(kwargs.get("skip_existing_tables", False))
+
         self._quiet = bool(kwargs.get("quiet", False))
 
         self._logger = self._setup_logger(log_file=kwargs.get("log_file") or None, quiet=self._quiet)
@@ -693,6 +695,12 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             for table_name in tables:
                 if isinstance(table_name, bytes):
                     table_name = table_name.decode()
+
+                if self._skip_existing_tables:
+                    self._sqlite_cur.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+                    if self._sqlite_cur.fetchone():
+                        self._logger.info(f"Skipping existing table: {table_name}")
+                        continue
 
                 self._logger.info(
                     "%s%sTransferring table %s",

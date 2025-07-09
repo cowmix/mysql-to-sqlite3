@@ -160,6 +160,11 @@ _copyright_header: str = f"mysql2sqlite version {package_version} Copyright (c) 
     "repacking it into a minimal amount of disk space",
 )
 @click.option(
+    "--skip-existing-tables",
+    is_flag=True,
+    help="Skip tables that already exist in the destination database.",
+)
+@click.option(
     "--use-buffered-cursors",
     is_flag=True,
     help="Use MySQLCursorBuffered for reading the MySQL database. This "
@@ -194,6 +199,7 @@ def cli(
     log_file: t.Union[str, "os.PathLike[t.Any]"],
     json_as_text: bool,
     vacuum: bool,
+    skip_existing_tables: bool,
     use_buffered_cursors: bool,
     quiet: bool,
     debug: bool,
@@ -276,6 +282,7 @@ def cli(
                     chunk=chunk,
                     json_as_text=json_as_text,
                     vacuum=vacuum,
+                    skip_existing_tables=skip_existing_tables,
                     buffered=use_buffered_cursors,
                     log_file=log_file,
                     quiet=quiet,
@@ -307,6 +314,7 @@ def cli(
                 chunk=chunk,
                 json_as_text=json_as_text,
                 vacuum=vacuum,
+                skip_existing_tables=skip_existing_tables,
                 buffered=use_buffered_cursors,
                 log_file=log_file,
                 quiet=quiet,

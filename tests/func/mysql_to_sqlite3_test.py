@@ -1408,3 +1408,45 @@ class TestMySQLtoSQLite:
         sqlite_tables: t.List[str] = sqlite_inspect.get_table_names()
 
         assert sqlite_tables == tables_with_min_rows
+
+    @pytest.mark.transfer
+    def test_skip_existing_tables(
+        self,
+        sqlite_database: "os.PathLike[t.Any]",
+        mysql_database: Database,
+        mysql_credentials: MySQLCredentials,
+        helpers: Helpers,
+        caplog: LogCaptureFixture,
+    ) -> None:
+        # Create a table in the SQLite database beforehand
+        sqlite_engine: Engine = create_engine(f"sqlite:///{sqlite_database}")
+        sqlite_cnx: Connection = sqlite_engine.connect()
+        sqlite_cnx.execute(text("CREATE TABLE articles (id INTEGER, title TEXT)"))
+        sqlite_cnx.execute(text("INSERT INTO articles (id, title) VALUES (123, 'My test article')"))
+        sqlite_cnx.commit()
+
+        proc: MySQLtoSQLite = MySQLtoSQLite(  # type: ignore[call-arg]
+            sqlite_file=sqlite_database,
+            mysql_user=mysql_credentials.user,
+            mysql_password=mysql_credentials.password,
+            mysql_database=mysql_credentials.database,
+            mysql_host=mysql_credentials.host,
+            mysql_port=mysql_credentials.port,
+            skip_existing_tables=True,
+        )
+        caplog.set_level(logging.INFO)
+        proc.transfer()
+
+        assert "Skipping existing table: articles" in [record.message for record in caplog.records]
+
+        # Check that the pre-existing table is untouched
+        result = list(sqlite_cnx.execute(text("SELECT * FROM articles")).fetchall())
+        assert len(result) == 1
+        assert result[0][0] == 123
+        assert result[0][1] == "My test article"
+
+        # Check that other tables were transferred
+        sqlite_inspect: Inspector = inspect(sqlite_engine)
+        sqlite_tables: t.List[str] = sqlite_inspect.get_table_names()
+        assert "authors" in sqlite_tables
+        assert "tags" in sqlite_tables
