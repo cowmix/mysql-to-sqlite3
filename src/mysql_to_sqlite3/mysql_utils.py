@@ -39,3 +39,14 @@ def mysql_supported_character_sets(charset: t.Optional[str] = None) -> t.Iterato
                         yield CharSet(index, charset, info[1])
                     except KeyError:
                         continue
+
+
+def get_mysql_tables(
+    conn: t.Any,
+) -> t.List[str]:
+    """Get a list of tables in the MySQL database."""
+    cursor = conn.cursor()
+    cursor.execute("SHOW TABLES")
+    tables = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+    return tables

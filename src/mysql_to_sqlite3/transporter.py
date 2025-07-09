@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import typing as t
+import fnmatch
 from datetime import timedelta
 from decimal import Decimal
 from math import ceil
@@ -18,7 +19,7 @@ from mysql.connector.abstracts import MySQLConnectionAbstract
 from mysql.connector.types import RowItemType
 from tqdm import tqdm, trange
 
-from mysql_to_sqlite3.mysql_utils import CHARSET_INTRODUCERS
+from mysql_to_sqlite3.mysql_utils import CHARSET_INTRODUCERS, get_mysql_tables
 from mysql_to_sqlite3.sqlite_utils import (
     CollatingSequences,
     Integer_Types,
@@ -83,7 +84,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         if kwargs.get("collation") is not None and str(kwargs.get("collation")).upper() in {
             CollatingSequences.BINARY,
-            CollatingSequences.NOCASE,
+            CollatingSequatingSequences.NOCASE,
             CollatingSequences.RTRIM,
         }:
             self._collation = str(kwargs.get("collation")).upper()
@@ -292,20 +293,20 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                             is_binary = False
                             is_hex = False
                             for b_prefix in ("B", "b"):
-                                if column_default.startswith(rf"{charset_introducer} {b_prefix}\'".encode()):
+                                if column_default.startswith(rf"{charset_introducer} {b_prefix}\\'".encode()):
                                     is_binary = True
                                     break
                             for x_prefix in ("X", "x"):
-                                if column_default.startswith(rf"{charset_introducer} {x_prefix}\'".encode()):
+                                if column_default.startswith(rf"{charset_introducer} {x_prefix}\\'".encode()):
                                     is_hex = True
                                     break
                             column_default = (
                                 column_default.replace(charset_introducer.encode(), b"")
-                                .replace(rb"x\'", b"")
-                                .replace(rb"X\'", b"")
-                                .replace(rb"b\'", b"")
-                                .replace(rb"B\'", b"")
-                                .replace(rb"\'", b"")
+                                .replace(rb"x\\\'", b"")
+                                .replace(rb"X\\\'", b"")
+                                .replace(rb"b\\\'", b"")
+                                .replace(rb"B\\\'", b"")
+                                .replace(rb"\\\'", b"")
                                 .replace(rb"'", b"")
                                 .strip()
                             )
@@ -346,20 +347,20 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                         is_binary = False
                         is_hex = False
                         for b_prefix in ("B", "b"):
-                            if column_default.startswith(rf"{charset_introducer} {b_prefix}\'"):
+                            if column_default.startswith(rf"{charset_introducer} {b_prefix}\\'"):
                                 is_binary = True
                                 break
                         for x_prefix in ("X", "x"):
-                            if column_default.startswith(rf"{charset_introducer} {x_prefix}\'"):
+                            if column_default.startswith(rf"{charset_introducer} {x_prefix}\\'"):
                                 is_hex = True
                                 break
                         column_default = (
                             column_default.replace(charset_introducer, "")
-                            .replace(r"x\'", "")
-                            .replace(r"X\'", "")
-                            .replace(r"b\'", "")
-                            .replace(r"B\'", "")
-                            .replace(r"\'", "")
+                            .replace(r"x\\\'", "")
+                            .replace(r"X\\\'", "")
+                            .replace(r"b\\\'", "")
+                            .replace(r"B\\\'", "")
+                            .replace(r"\\\'", "")
                             .replace(r"'", "")
                             .strip()
                         )
@@ -368,8 +369,8 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                         if is_hex:
                             return f"DEFAULT x'{column_default}'"
                         return f"DEFAULT '{column_default}'"
-            return "DEFAULT '{}'".format(column_default.replace(r"\'", r"''"))
-        return "DEFAULT '{}'".format(str(column_default).replace(r"\'", r"''"))
+            return "DEFAULT '{}'".format(column_default.replace(r"\\\'", r"''"))
+        return "DEFAULT '{}'".format(str(column_default).replace(r"\\\'", r"''"))
 
     @classmethod
     def _data_type_collation_sequence(
@@ -542,12 +543,6 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                 WHERE i.TABLE_SCHEMA = %s
                 AND i.TABLE_NAME = %s
                 AND i.CONSTRAINT_TYPE = %s
-                GROUP BY i.CONSTRAINT_NAME,
-                         k.COLUMN_NAME,
-                         k.REFERENCED_TABLE_NAME,
-                         k.REFERENCED_COLUMN_NAME,
-                         c.UPDATE_RULE,
-                         c.DELETE_RULE
                 """.format(
                     JOIN=(
                         "JOIN"
@@ -656,46 +651,34 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
     def _get_tables_to_transfer(self) -> t.List[str]:
         """Get the list of tables to transfer based on configured filters."""
-        if len(self._mysql_tables) > 0 or len(self._exclude_mysql_tables) > 0:
-            # transfer only specific tables
-            specific_tables: t.Sequence[str] = (
-                self._exclude_mysql_tables if len(self._exclude_mysql_tables) > 0 else self._mysql_tables
-            )
+        all_tables = get_mysql_tables(self._mysql)
+        
+        if not self._mysql_tables and not self._exclude_mysql_tables:
+            return all_tables
 
-            self._mysql_cur_prepared.execute(
-                """
-                SELECT TABLE_NAME
-                FROM information_schema.TABLES
-                WHERE TABLE_SCHEMA = SCHEMA()
-                AND TABLE_NAME {exclude} IN ({placeholders})
-            """.format(
-                    exclude="NOT" if len(self._exclude_mysql_tables) > 0 else "",
-                    placeholders=("%s, " * len(specific_tables)).rstrip(" ,"),
-                ),
-                specific_tables,
-            )
-            tables: t.List[str] = [row[0].decode() if isinstance(row[0], bytes) else row[0] for row in self._mysql_cur_prepared.fetchall()]
-        else:
-            # transfer all tables
-            self._mysql_cur.execute(
-                """
-                SELECT TABLE_NAME
-                FROM information_schema.TABLES
-                WHERE TABLE_SCHEMA = SCHEMA()
-            """
-            )
-            tables = [row[0].decode() if isinstance(row[0], bytes) else row[0] for row in self._mysql_cur.fetchall()]
+        if self._mysql_tables:
+            tables_to_transfer = [
+                table
+                for table in all_tables
+                if any(fnmatch.fnmatch(table, pattern) for pattern in self._mysql_tables)
+            ]
+        elif self._exclude_mysql_tables:
+            tables_to_transfer = [
+                table
+                for table in all_tables
+                if not any(fnmatch.fnmatch(table, pattern) for pattern in self._exclude_mysql_tables)
+            ]
         
         if self._min_rows_to_export > 0:
-            tables_to_transfer = []
-            for table in tables:
+            filtered_tables = []
+            for table in tables_to_transfer:
                 self._mysql_cur_dict.execute(f"SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{self._mysql_database}' AND TABLE_NAME = '{table}'")
                 row_count = self._mysql_cur_dict.fetchone()
                 if row_count and row_count['TABLE_ROWS'] >= self._min_rows_to_export:
-                    tables_to_transfer.append(table)
-            return tables_to_transfer
+                    filtered_tables.append(table)
+            return filtered_tables
         
-        return tables
+        return tables_to_transfer
 
     def transfer(self) -> None:""
 
@@ -779,3 +762,6 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             self._sqlite_cur.execute("VACUUM")
 
         self._logger.info("Done!")
+
+        self._mysql.close()
+        self._sqlite.close()

@@ -51,7 +51,7 @@ _copyright_header: str = f"mysql2sqlite version {package_version} Copyright (c) 
     "--mysql-tables",
     type=tuple,
     cls=OptionEatAll,
-    help="Transfer only these specific tables (space separated table names). "
+    help="Transfer only these specific tables (space separated table names and patterns). "
     "Implies --without-foreign-keys which inhibits the transfer of foreign keys. "
     "Can not be used together with --exclude-mysql-tables.",
 )
@@ -60,7 +60,7 @@ _copyright_header: str = f"mysql2sqlite version {package_version} Copyright (c) 
     "--exclude-mysql-tables",
     type=tuple,
     cls=OptionEatAll,
-    help="Transfer all tables except these specific tables (space separated table names). "
+    help="Transfer all tables except these specific tables (space separated table names and patterns). "
     "Implies --without-foreign-keys which inhibits the transfer of foreign keys. "
     "Can not be used together with --mysql-tables.",
 )

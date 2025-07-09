@@ -1320,3 +1320,91 @@ class TestMySQLtoSQLite:
         sqlite_cnx.close()
         mysql_engine.dispose()
         sqlite_engine.dispose()
+
+    @pytest.mark.transfer
+    @pytest.mark.parametrize(
+        "chunk, vacuum, buffered, prefix_indices",
+        [
+            # 0000
+            pytest.param(
+                None,
+                False,
+                False,
+                False,
+                id="no chunk, no vacuum, no buffered cursor, no prefix indices",
+            ),
+            # 1111
+            pytest.param(
+                10,
+                True,
+                True,
+                True,
+                id="chunk, vacuum, buffered cursor, prefix indices",
+            ),
+        ],
+    )
+    def test_transfer_min_rows_from_mysql_to_sqlite(
+        self,
+        sqlite_database: "os.PathLike[t.Any]",
+        mysql_database: Database,
+        mysql_credentials: MySQLCredentials,
+        helpers: Helpers,
+        caplog: LogCaptureFixture,
+        chunk: t.Optional[int],
+        vacuum: bool,
+        buffered: bool,
+        prefix_indices: bool,
+    ) -> None:
+        min_rows_to_export: int = 10
+
+        proc: MySQLtoSQLite = MySQLtoSQLite(  # type: ignore[call-arg]
+            sqlite_file=sqlite_database,
+            mysql_user=mysql_credentials.user,
+            mysql_password=mysql_credentials.password,
+            mysql_database=mysql_credentials.database,
+            min_rows_to_export=min_rows_to_export,
+            mysql_host=mysql_credentials.host,
+            mysql_port=mysql_credentials.port,
+            prefix_indices=prefix_indices,
+        )
+        caplog.set_level(logging.DEBUG)
+        proc.transfer()
+
+        mysql_engine: Engine = create_engine(
+            f"mysql+mysqldb://{mysql_credentials.user}:{mysql_credentials.password}@{mysql_credentials.host}:{mysql_credentials.port}/{mysql_credentials.database}"
+        )
+        mysql_cnx: Connection = mysql_engine.connect()
+        mysql_inspect: Inspector = inspect(mysql_engine)
+        mysql_tables: t.List[str] = mysql_inspect.get_table_names()
+
+        tables_with_min_rows: t.List[str] = []
+        for table in mysql_tables:
+            result = mysql_cnx.execute(text(f"SELECT COUNT(*) FROM {table}"))
+            row_count = result.scalar()
+            if row_count >= min_rows_to_export:
+                tables_with_min_rows.append(table)
+
+        assert all(
+            message in [record.message for record in caplog.records]
+            for message in set(
+                [
+                    f"Transferring table {table}"
+                    for table in tables_with_min_rows
+                ]
+                + ["Done!"]
+            )
+        )
+        assert all(record.levelname == "INFO" for record in caplog.records)
+        assert not any(record.levelname == "ERROR" for record in caplog.records)
+
+        sqlite_engine: Engine = create_engine(
+            f"sqlite:///{sqlite_database}",
+            json_serializer=json.dumps,
+            json_deserializer=json.loads,
+        )
+
+        sqlite_cnx: Connection = sqlite_engine.connect()
+        sqlite_inspect: Inspector = inspect(sqlite_engine)
+        sqlite_tables: t.List[str] = sqlite_inspect.get_table_names()
+
+        assert sqlite_tables == tables_with_min_rows
