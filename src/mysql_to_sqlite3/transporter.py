@@ -300,6 +300,9 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
         logger: logging.Logger = logging.getLogger(cls.__name__)
         logger.setLevel(logging.DEBUG)
 
+        # Clear any existing handlers to prevent duplicates
+        logger.handlers.clear()
+
         if not quiet:
             screen_handler = logging.StreamHandler(stream=stdout)
             screen_handler.setFormatter(formatter)
@@ -309,6 +312,9 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             file_handler = logging.FileHandler(realpath(log_file), mode="w")
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
+
+        # Prevent propagation to root logger to avoid duplicate messages
+        logger.propagate = False
 
         return logger
 
