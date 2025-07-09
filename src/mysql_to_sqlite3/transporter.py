@@ -137,13 +137,12 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             'connection_timeout': 300,  # 5 minutes
             'use_unicode': True,
             'sql_mode': 'TRADITIONAL',
-            # Increase timeouts for large transfers
+            # Increase timeouts for large transfers (session-level only)
             'init_command': (
                 "SET SESSION wait_timeout=86400, "
                 "interactive_timeout=86400, "
                 "net_read_timeout=600, "
-                "net_write_timeout=600, "
-                "max_allowed_packet=1073741824"  # 1GB
+                "net_write_timeout=600"
             )
         }
 
