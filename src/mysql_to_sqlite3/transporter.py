@@ -137,8 +137,6 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             'connection_timeout': 300,  # 5 minutes
             'use_unicode': True,
             'sql_mode': 'TRADITIONAL',
-            'reconnect': True,  # Enable automatic reconnection
-            'consume_results': True,  # Consume any pending results
             # Increase timeouts for large transfers
             'init_command': (
                 "SET SESSION wait_timeout=86400, "
