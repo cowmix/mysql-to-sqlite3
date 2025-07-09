@@ -84,7 +84,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         if kwargs.get("collation") is not None and str(kwargs.get("collation")).upper() in {
             CollatingSequences.BINARY,
-            CollatingSequatingSequences.NOCASE,
+            CollatingSequences.NOCASE,
             CollatingSequences.RTRIM,
         }:
             self._collation = str(kwargs.get("collation")).upper()
