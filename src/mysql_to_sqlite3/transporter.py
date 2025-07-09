@@ -652,8 +652,8 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             )
             raise
 
-    def transfer(self) -> None:
-        """The primary and only method with which we transfer all the data."""
+    def _get_tables_to_transfer(self) -> t.List[str]:
+        """Get the list of tables to transfer based on configured filters."""
         if len(self._mysql_tables) > 0 or len(self._exclude_mysql_tables) > 0:
             # transfer only specific tables
             specific_tables: t.Sequence[str] = (
@@ -672,7 +672,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                 ),
                 specific_tables,
             )
-            tables: t.Iterable[RowItemType] = (row[0] for row in self._mysql_cur_prepared.fetchall())
+            tables: t.List[str] = [row[0].decode() if isinstance(row[0], bytes) else row[0] for row in self._mysql_cur_prepared.fetchall()]
         else:
             # transfer all tables
             self._mysql_cur.execute(
@@ -682,7 +682,13 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                 WHERE TABLE_SCHEMA = SCHEMA()
             """
             )
-            tables = (row[0].decode() for row in self._mysql_cur.fetchall())  # type: ignore[union-attr]
+            tables = [row[0].decode() if isinstance(row[0], bytes) else row[0] for row in self._mysql_cur.fetchall()]
+        
+        return tables
+
+    def transfer(self) -> None:
+        """The primary and only method with which we transfer all the data."""
+        tables = self._get_tables_to_transfer()
 
         try:
             # turn off foreign key checking in SQLite while transferring data

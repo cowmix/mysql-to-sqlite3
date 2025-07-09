@@ -4,6 +4,7 @@ import os
 import sys
 import typing as t
 from datetime import datetime
+from pathlib import Path
 
 import click
 from mysql.connector import CharacterSet
@@ -106,6 +107,13 @@ _copyright_header: str = f"mysql2sqlite version {package_version} Copyright (c) 
     is_flag=True,
     help="Do not transfer table data, DDL only.",
 )
+@click.option(
+    "-O",
+    "--one-file-per-table",
+    is_flag=True,
+    help="Create one SQLite file per MySQL table. The SQLite files will be named using the pattern: "
+    "<sqlite-file-base>_<table-name>.sqlite3",
+)
 @click.option("-h", "--mysql-host", default="localhost", help="MySQL host. Defaults to localhost.")
 @click.option("-P", "--mysql-port", type=int, default=3306, help="MySQL port. Defaults to 3306.")
 @click.option(
@@ -167,6 +175,7 @@ def cli(
     without_foreign_keys: bool,
     without_tables: bool,
     without_data: bool,
+    one_file_per_table: bool,
     mysql_host: str,
     mysql_port: int,
     mysql_charset: str,
@@ -202,32 +211,95 @@ def cli(
         if mysql_tables and exclude_mysql_tables:
             raise click.UsageError("Illegal usage: --mysql-tables and --exclude-mysql-tables are mutually exclusive!")
 
-        converter = MySQLtoSQLite(
-            sqlite_file=sqlite_file,
-            mysql_user=mysql_user,
-            mysql_password=mysql_password or prompt_mysql_password,
-            mysql_database=mysql_database,
-            mysql_tables=mysql_tables,
-            exclude_mysql_tables=exclude_mysql_tables,
-            limit_rows=limit_rows,
-            collation=collation,
-            prefix_indices=prefix_indices,
-            without_foreign_keys=without_foreign_keys or (mysql_tables is not None and len(mysql_tables) > 0),
-            without_tables=without_tables,
-            without_data=without_data,
-            mysql_host=mysql_host,
-            mysql_port=mysql_port,
-            mysql_charset=mysql_charset,
-            mysql_collation=mysql_collation,
-            mysql_ssl_disabled=skip_ssl,
-            chunk=chunk,
-            json_as_text=json_as_text,
-            vacuum=vacuum,
-            buffered=use_buffered_cursors,
-            log_file=log_file,
-            quiet=quiet,
-        )
-        converter.transfer()
+        if one_file_per_table:
+            # When using one file per table, we need to get the list of tables first
+            # Create a temporary converter just to get the table list
+            temp_converter = MySQLtoSQLite(
+                sqlite_file=sqlite_file,  # This won't be used for actual transfer
+                mysql_user=mysql_user,
+                mysql_password=mysql_password or prompt_mysql_password,
+                mysql_database=mysql_database,
+                mysql_tables=mysql_tables,
+                exclude_mysql_tables=exclude_mysql_tables,
+                mysql_host=mysql_host,
+                mysql_port=mysql_port,
+                mysql_charset=mysql_charset,
+                mysql_collation=mysql_collation,
+                mysql_ssl_disabled=skip_ssl,
+                quiet=quiet,
+            )
+            
+            # Get the list of tables
+            tables_to_transfer = temp_converter._get_tables_to_transfer()
+            
+            # Process each table separately
+            sqlite_path = Path(sqlite_file)
+            base_name = sqlite_path.stem
+            base_dir = sqlite_path.parent
+            
+            for table_name in tables_to_transfer:
+                # Create a filename for this table
+                table_sqlite_file = base_dir / f"{base_name}_{table_name}.sqlite3"
+                
+                click.echo(f"Transferring table '{table_name}' to '{table_sqlite_file}'...")
+                
+                # Create a converter for this specific table
+                converter = MySQLtoSQLite(
+                    sqlite_file=str(table_sqlite_file),
+                    mysql_user=mysql_user,
+                    mysql_password=mysql_password or prompt_mysql_password,
+                    mysql_database=mysql_database,
+                    mysql_tables=[table_name],  # Transfer only this table
+                    exclude_mysql_tables=None,
+                    limit_rows=limit_rows,
+                    collation=collation,
+                    prefix_indices=prefix_indices,
+                    without_foreign_keys=True,  # Foreign keys don't make sense across separate files
+                    without_tables=without_tables,
+                    without_data=without_data,
+                    mysql_host=mysql_host,
+                    mysql_port=mysql_port,
+                    mysql_charset=mysql_charset,
+                    mysql_collation=mysql_collation,
+                    mysql_ssl_disabled=skip_ssl,
+                    chunk=chunk,
+                    json_as_text=json_as_text,
+                    vacuum=vacuum,
+                    buffered=use_buffered_cursors,
+                    log_file=log_file,
+                    quiet=quiet,
+                )
+                converter.transfer()
+                
+            click.echo(f"All tables transferred to separate SQLite files in '{base_dir}'")
+        else:
+            # Original behavior - all tables in one file
+            converter = MySQLtoSQLite(
+                sqlite_file=sqlite_file,
+                mysql_user=mysql_user,
+                mysql_password=mysql_password or prompt_mysql_password,
+                mysql_database=mysql_database,
+                mysql_tables=mysql_tables,
+                exclude_mysql_tables=exclude_mysql_tables,
+                limit_rows=limit_rows,
+                collation=collation,
+                prefix_indices=prefix_indices,
+                without_foreign_keys=without_foreign_keys or (mysql_tables is not None and len(mysql_tables) > 0),
+                without_tables=without_tables,
+                without_data=without_data,
+                mysql_host=mysql_host,
+                mysql_port=mysql_port,
+                mysql_charset=mysql_charset,
+                mysql_collation=mysql_collation,
+                mysql_ssl_disabled=skip_ssl,
+                chunk=chunk,
+                json_as_text=json_as_text,
+                vacuum=vacuum,
+                buffered=use_buffered_cursors,
+                log_file=log_file,
+                quiet=quiet,
+            )
+            converter.transfer()
     except KeyboardInterrupt:
         if debug:
             raise
