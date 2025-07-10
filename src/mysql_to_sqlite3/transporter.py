@@ -632,7 +632,8 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
         except sqlite3.Error:
             return False
 
-    def _build_create_table_sql(self, table_name: str) -> str:
+    def _build_create_table_sql(self, table_name: str) -> t.Tuple[str, str]:
+        """Builds the CREATE TABLE and CREATE INDEX SQL statements."""
         sql: str = f'CREATE TABLE IF NOT EXISTS "{table_name}" ('
         primary: str = ""
         indices: str = ""
@@ -751,7 +752,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                                 columns=", ".join(f'"{column}"' for column in columns.split(","))
                             )
                     else:
-                        indices += """CREATE {unique} INDEX IF NOT EXISTS "{name}" ON "{table}" ({columns});""".format(
+                        indices += '''CREATE {unique} INDEX IF NOT EXISTS "{name}" ON "{table}" ({columns});'''.format(
                             unique="UNIQUE" if index["unique"] in {1, "1"} else "",
                             name=(
                                 f"{table_name}_{index_name}"
@@ -759,7 +760,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                                 else index_name
                             ),
                             table=table_name,
-                            columns=", ".join(f'"{column}"' for column in columns.split(",")),
+                            columns=", ".join(f'"{column}"' for column in columns.split(","))
                         )
 
         sql += primary
@@ -792,7 +793,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                             else "LEFT JOIN"
                         )
                     ),
-                    (self._mysql_database, table_name, "FOREIGN KEY"),
+                    (self._mysql_database, table_name),
                 )
                 for foreign_key in cursor.fetchall():
                     if foreign_key is not None:
@@ -803,17 +804,20 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                         )
 
         sql += "\n);"
-        sql += indices
 
-        return sql
+        return sql, indices
 
-    def _create_table(self, table_name: str) -> None:
+    def _create_table(self, table_name: str, create_indexes: bool = True) -> str:
         """Create table with connection management."""
         try:
-            sql_script = self._build_create_table_sql(table_name)
-            self._sqlite_cur.executescript(sql_script)
+            table_sql, index_sql = self._build_create_table_sql(table_name)
+            if create_indexes:
+                self._sqlite_cur.executescript(table_sql + index_sql)
+            else:
+                self._sqlite_cur.executescript(table_sql)
             self._sqlite.commit()
-                
+            return index_sql
+
         except mysql.connector.Error as err:
             self._logger.error(
                 "MySQL failed reading table definition from table %s: %s",
@@ -1172,15 +1176,12 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             
             # Optimize SQLite for bulk inserts
             if self._optimize_for_blobs:
-                # Aggressive optimizations for BLOB data
-                self._sqlite_cur.execute("PRAGMA synchronous=OFF")
-                self._sqlite_cur.execute("PRAGMA journal_mode=OFF")  # No crash safety!
-                self._sqlite_cur.execute("PRAGMA cache_size=-2000000")  # 2GB
-                self._sqlite_cur.execute("PRAGMA temp_store=MEMORY")
-                self._sqlite_cur.execute("PRAGMA mmap_size=10737418240")  # 10GB
-                self._sqlite_cur.execute("PRAGMA wal_autocheckpoint=100000")  # Less frequent
+                # Balanced and crash-safe optimizations for BLOB data
+                self._sqlite_cur.execute("PRAGMA journal_mode=WAL")
+                self._sqlite_cur.execute("PRAGMA synchronous=NORMAL")
+                self._sqlite_cur.execute("PRAGMA locking_mode=EXCLUSIVE")
                 self._logger.warning(
-                    "Using aggressive BLOB optimizations - no crash safety!"
+                    "Using balanced and crash-safe BLOB optimizations."
                 )
             else:
                 # Standard optimizations (current behavior)
@@ -1211,6 +1212,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                     table_name,
                 )
 
+                index_sql = ""
                 if not self._without_tables:
                     # Check if table exists (for resume case)
                     self._sqlite_cur.execute(
@@ -1218,7 +1220,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                         (table_name,)
                     )
                     if not self._sqlite_cur.fetchone():
-                        self._create_table(table_name)
+                        index_sql = self._create_table(table_name, create_indexes=False)
 
                 if not self._without_data:
                     # Get total record count
@@ -1241,21 +1243,33 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                             columns = tuple(column[0] for column in cursor.description)
                         
                         # Build SQL for insertion
-                        sql = """
+                        sql = '''
                             INSERT OR IGNORE
                             INTO "{table}" ({fields})
                             VALUES ({placeholders})
-                        """.format(
+                        '''.format(
                             table=table_name,
-                            fields=('"{}", ' * len(columns)).rstrip(" ,").format(*columns),
+                            fields=('"{}"'.format(col) for col in columns),
                             placeholders=("?, " * len(columns)).rstrip(" ,"),
                         )
                         
-                        self._transfer_table_data(
-                            table_name=table_name,
-                            sql=sql,
-                            total_records=total_records_count,
-                        )
+                        # Use a single transaction for the whole table
+                        try:
+                            self._sqlite_cur.execute("BEGIN IMMEDIATE")
+                            self._transfer_table_data(
+                                table_name=table_name,
+                                sql=sql,
+                                total_records=total_records_count,
+                            )
+                            self._sqlite.commit()
+                        except Exception as e:
+                            self._sqlite.rollback()
+                            raise e
+
+                if not self._without_tables and index_sql:
+                    self._logger.info(f"Creating indexes for table {table_name}")
+                    self._sqlite_cur.executescript(index_sql)
+                    self._sqlite.commit()
 
         except Exception:
             raise
@@ -1275,6 +1289,11 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
         if self._vacuum:
             self._logger.info("Vacuuming created SQLite database file.\nThis might take a while.")
             self._sqlite_cur.execute("VACUUM")
+            self._logger.info("Analyzing database.")
+            self._sqlite_cur.execute("ANALYZE")
+            self._logger.info("Checking database integrity.")
+            self._sqlite_cur.execute("PRAGMA quick_check;")
+
 
         self._logger.info("Done!")
         
