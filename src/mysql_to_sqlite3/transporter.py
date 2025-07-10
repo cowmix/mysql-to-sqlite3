@@ -7,8 +7,10 @@ import sqlite3
 import typing as t
 import fnmatch
 import time
+import traceback
+import threading
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import timedelta, datetime
 from decimal import Decimal
 from math import ceil
 from os.path import realpath
@@ -110,6 +112,11 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
         self._mysql_ssl_disabled = bool(kwargs.get("mysql_ssl_disabled", False))
 
         self._current_chunk_number = 0
+        self._current_row_number = 0
+        self._last_progress_time = time.time()
+        self._stall_threshold = 30  # seconds without progress
+        self._progress_monitor_thread = None
+        self._transfer_active = False
 
         self._chunk_size = kwargs.get("chunk") or None
 
@@ -142,7 +149,8 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                 "SET SESSION wait_timeout=86400, "
                 "interactive_timeout=86400, "
                 "net_read_timeout=600, "
-                "net_write_timeout=600"
+                "net_write_timeout=600, "
+                "max_allowed_packet=1073741824"  # 1GB
             )
         }
 
@@ -164,6 +172,83 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
         # Initial MySQL connection
         self._connect_to_mysql()
 
+    def _progress_monitor(self, table_name: str, total_records: int) -> None:
+        """Monitor thread to detect stalls and provide diagnostic information."""
+        last_row = self._current_row_number
+        last_chunk = self._current_chunk_number
+        
+        while self._transfer_active:
+            time.sleep(10)  # Check every 10 seconds
+            
+            current_row = self._current_row_number
+            current_chunk = self._current_chunk_number
+            current_time = time.time()
+            
+            # Check if progress has stalled
+            if current_row == last_row and current_chunk == last_chunk:
+                stall_duration = current_time - self._last_progress_time
+                
+                if stall_duration > self._stall_threshold:
+                    self._logger.warning(
+                        "⚠️  STALL DETECTED: No progress for %.1f seconds on table '%s'",
+                        stall_duration, table_name
+                    )
+                    self._logger.warning(
+                        "   Current state: Row %d/%d, Chunk %d, SQLite file size: %s",
+                        current_row, total_records, current_chunk,
+                        self._get_file_size_human(self._sqlite_file)
+                    )
+                    
+                    # Check MySQL connection
+                    try:
+                        self._mysql.ping(reconnect=False)
+                        self._logger.info("   MySQL connection: ALIVE")
+                    except:
+                        self._logger.error("   MySQL connection: DEAD - attempting reconnect")
+                        try:
+                            self._connect_to_mysql(is_reconnect=True)
+                        except Exception as e:
+                            self._logger.error("   Reconnection failed: %s", e)
+                    
+                    # Check SQLite status
+                    try:
+                        self._sqlite_cur.execute("SELECT COUNT(*) FROM sqlite_master")
+                        self._logger.info("   SQLite connection: ALIVE")
+                    except Exception as e:
+                        self._logger.error("   SQLite connection: ERROR - %s", e)
+                    
+                    # Log current MySQL process list
+                    try:
+                        with self._mysql_connection_manager('dict') as cursor:
+                            cursor.execute("SHOW PROCESSLIST")
+                            processes = cursor.fetchall()
+                            active_processes = [p for p in processes if p['db'] == self._mysql_database]
+                            if active_processes:
+                                self._logger.info("   Active MySQL processes for this database:")
+                                for proc in active_processes:
+                                    self._logger.info("     - ID: %s, State: %s, Time: %s, Info: %s",
+                                                    proc['Id'], proc['State'], proc['Time'], 
+                                                    str(proc['Info'])[:100] if proc['Info'] else 'NULL')
+                    except Exception as e:
+                        self._logger.error("   Failed to get MySQL process list: %s", e)
+            else:
+                # Progress made, update tracking
+                last_row = current_row
+                last_chunk = current_chunk
+                self._last_progress_time = current_time
+
+    def _get_file_size_human(self, filepath: str) -> str:
+        """Get human-readable file size."""
+        try:
+            size = os.path.getsize(filepath)
+            for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                if size < 1024.0:
+                    return f"{size:.2f} {unit}"
+                size /= 1024.0
+            return f"{size:.2f} PB"
+        except:
+            return "Unknown"
+
     def _connect_to_mysql(self, is_reconnect: bool = False) -> None:
         """Establish MySQL connection with proper configuration."""
         try:
@@ -173,6 +258,8 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                     self._mysql.close()
                 except:
                     pass  # Ignore errors when closing broken connections
+            
+            self._logger.debug("Attempting MySQL connection to %s:%d", self._mysql_host, self._mysql_port)
             
             _mysql_connection = mysql.connector.connect(**self._mysql_connection_config)
             if isinstance(_mysql_connection, MySQLConnectionAbstract):
@@ -187,6 +274,10 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             self._mysql_cur = self._mysql.cursor(buffered=False, raw=True)  # Unbuffered for large results
             self._mysql_cur_prepared = self._mysql.cursor(prepared=True)
             self._mysql_cur_dict = self._mysql.cursor(buffered=True, dictionary=True)  # Buffered for metadata
+            
+            # Get server info
+            server_info = self._mysql.get_server_info()
+            self._logger.debug("Connected to MySQL server version: %s", server_info)
             
             # Only log when it's an initial connection or a reconnection
             if is_reconnect:
@@ -717,33 +808,70 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             raise
 
     def _chunked_data_iterator(self, table_name: str, total_records: int) -> Iterator[List[Tuple[Any, ...]]]:
-        """Iterator that yields data chunks with proper connection management."""
+        """Iterator that yields data chunks with proper connection management and detailed debugging."""
+        chunk_start_time = time.time()
+        
+        self._logger.debug("Starting data iterator for table '%s' with %d total records", table_name, total_records)
+        
         if self._chunk_size is None or self._chunk_size <= 0:
             # Non-chunked: fetch all at once
+            self._logger.info("Using non-chunked transfer mode")
             with self._mysql_connection_manager('raw') as cursor:
-                cursor.execute(
-                    "SELECT * FROM `{table_name}` {limit}".format(
-                        table_name=table_name,
-                        limit=f"LIMIT {self._limit_rows}" if self._limit_rows > 0 else "",
-                    )
+                query = "SELECT * FROM `{table_name}` {limit}".format(
+                    table_name=table_name,
+                    limit=f"LIMIT {self._limit_rows}" if self._limit_rows > 0 else "",
                 )
+                self._logger.debug("Executing query: %s", query)
+                cursor.execute(query)
                 
                 # Fetch in reasonable chunks to avoid memory issues
                 chunk_size = min(50000, total_records) if total_records > 0 else 50000
                 
                 while True:
+                    fetch_start = time.time()
+                    self._logger.debug("Fetching next %d rows...", chunk_size)
+                    
                     chunk = cursor.fetchmany(chunk_size)
+                    
                     if not chunk:
+                        self._logger.debug("No more data to fetch")
                         break
-                    yield [
-                        tuple(encode_data_for_sqlite(col) if col is not None else None for col in row)
-                        for row in chunk
-                    ]
+                    
+                    fetch_duration = time.time() - fetch_start
+                    self._logger.debug("Fetched %d rows in %.2f seconds", len(chunk), fetch_duration)
+                    
+                    # Process and yield chunk
+                    processed_chunk = []
+                    for i, row in enumerate(chunk):
+                        try:
+                            processed_row = tuple(encode_data_for_sqlite(col) if col is not None else None for col in row)
+                            processed_chunk.append(processed_row)
+                            self._current_row_number += 1
+                            
+                            # Log sample of data every 10000 rows
+                            if self._current_row_number % 10000 == 0:
+                                self._logger.debug("Processed %d rows total", self._current_row_number)
+                                # Log data size of this row
+                                row_size = sum(len(str(col)) if col is not None else 0 for col in row)
+                                self._logger.debug("Sample row %d size: %d bytes", self._current_row_number, row_size)
+                                
+                        except Exception as e:
+                            self._logger.error("Error processing row %d: %s", i, str(e))
+                            self._logger.debug("Problematic row data (first 100 chars): %s", str(row)[:100])
+                            raise
+                    
+                    self._last_progress_time = time.time()
+                    yield processed_chunk
+                    
         else:
             # Chunked transfer using LIMIT/OFFSET
+            self._logger.info("Using chunked transfer mode with chunk size %d", self._chunk_size)
             offset = 0
             
             while offset < total_records:
+                chunk_num = offset // self._chunk_size + 1
+                self._current_chunk_number = chunk_num
+                
                 with self._mysql_connection_manager('raw') as cursor:
                     limit_clause = f"LIMIT {self._chunk_size} OFFSET {offset}"
                     if self._limit_rows > 0:
@@ -752,24 +880,96 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                             break
                         limit_clause = f"LIMIT {remaining} OFFSET {offset}"
                     
-                    cursor.execute(f"SELECT * FROM `{table_name}` {limit_clause}")
+                    query = f"SELECT * FROM `{table_name}` {limit_clause}"
+                    self._logger.debug("Executing chunk %d query: %s", chunk_num, query)
+                    
+                    query_start = time.time()
+                    cursor.execute(query)
+                    query_duration = time.time() - query_start
+                    
+                    fetch_start = time.time()
                     chunk = cursor.fetchall()
+                    fetch_duration = time.time() - fetch_start
+                    
+                    self._logger.info(
+                        "Chunk %d: Query took %.2fs, Fetch took %.2fs, Got %d rows",
+                        chunk_num, query_duration, fetch_duration, len(chunk)
+                    )
                     
                     if not chunk:
+                        self._logger.debug("No more data in chunk %d", chunk_num)
                         break
                     
-                    yield [
-                        tuple(encode_data_for_sqlite(col) if col is not None else None for col in row)
-                        for row in chunk
-                    ]
+                    # Process chunk
+                    processed_chunk = []
+                    chunk_total_size = 0
+                    
+                    for i, row in enumerate(chunk):
+                        try:
+                            processed_row = tuple(encode_data_for_sqlite(col) if col is not None else None for col in row)
+                            processed_chunk.append(processed_row)
+                            self._current_row_number += 1
+                            
+                            # Calculate row size
+                            row_size = sum(
+                                len(col) if isinstance(col, (bytes, bytearray)) else len(str(col)) if col is not None else 0 
+                                for col in row
+                            )
+                            chunk_total_size += row_size
+                            
+                            # Log large rows
+                            if row_size > 1024 * 1024:  # 1MB
+                                self._logger.warning(
+                                    "Large row detected at position %d in chunk %d: %.2f MB",
+                                    i, chunk_num, row_size / (1024 * 1024)
+                                )
+                                
+                        except Exception as e:
+                            self._logger.error("Error processing row %d in chunk %d: %s", i, chunk_num, str(e))
+                            self._logger.debug("Error traceback: %s", traceback.format_exc())
+                            # Log which column caused the issue
+                            for j, col in enumerate(row):
+                                try:
+                                    _ = encode_data_for_sqlite(col) if col is not None else None
+                                except Exception as col_err:
+                                    self._logger.error("Error in column %d: %s", j, str(col_err))
+                                    self._logger.debug("Column type: %s, length: %d", type(col), len(str(col)) if col else 0)
+                            raise
+                    
+                    self._logger.debug(
+                        "Chunk %d total size: %.2f MB (avg %.2f KB per row)",
+                        chunk_num, chunk_total_size / (1024 * 1024), 
+                        (chunk_total_size / len(chunk)) / 1024 if chunk else 0
+                    )
+                    
+                    self._last_progress_time = time.time()
+                    yield processed_chunk
                     
                     offset += len(chunk)
 
     def _transfer_table_data(self, table_name: str, sql: str, total_records: int = 0) -> None:
-        """Transfer table data with robust connection handling."""
+        """Transfer table data with robust connection handling and detailed debugging."""
         try:
             if total_records == 0:
+                self._logger.info("No records to transfer for table '%s'", table_name)
                 return
+            
+            self._logger.info("Starting transfer of %d records for table '%s'", total_records, table_name)
+            self._logger.debug("Insert SQL: %s", sql[:200] + "..." if len(sql) > 200 else sql)
+            
+            # Reset counters
+            self._current_row_number = 0
+            self._current_chunk_number = 0
+            self._last_progress_time = time.time()
+            
+            # Start progress monitor thread
+            self._transfer_active = True
+            self._progress_monitor_thread = threading.Thread(
+                target=self._progress_monitor, 
+                args=(table_name, total_records),
+                daemon=True
+            )
+            self._progress_monitor_thread.start()
             
             # Calculate progress tracking
             if self._chunk_size and self._chunk_size > 0:
@@ -778,34 +978,113 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             else:
                 progress_bar = trange(1, disable=self._quiet, desc=f"Transferring {table_name}")
             
+            transfer_start_time = time.time()
+            total_bytes_transferred = 0
+            
             # Process data in chunks
-            for chunk_data in self._chunked_data_iterator(table_name, total_records):
+            for chunk_index, chunk_data in enumerate(self._chunked_data_iterator(table_name, total_records)):
                 if not chunk_data:
+                    self._logger.debug("Empty chunk received at index %d", chunk_index)
                     break
                 
-                # Insert chunk into SQLite
-                self._sqlite_cur.executemany(sql, chunk_data)
+                chunk_start_time = time.time()
                 
-                # Commit periodically to avoid large transactions
-                self._sqlite.commit()
+                # Calculate chunk size
+                chunk_bytes = sum(
+                    sum(len(col) if isinstance(col, (bytes, bytearray)) else len(str(col)) if col is not None else 0 
+                        for col in row)
+                    for row in chunk_data
+                )
+                total_bytes_transferred += chunk_bytes
+                
+                self._logger.debug(
+                    "Processing chunk %d with %d rows (%.2f MB)",
+                    chunk_index + 1, len(chunk_data), chunk_bytes / (1024 * 1024)
+                )
+                
+                # Insert chunk into SQLite
+                try:
+                    insert_start = time.time()
+                    self._sqlite_cur.executemany(sql, chunk_data)
+                    insert_duration = time.time() - insert_start
+                    
+                    commit_start = time.time()
+                    self._sqlite.commit()
+                    commit_duration = time.time() - commit_start
+                    
+                    chunk_duration = time.time() - chunk_start_time
+                    
+                    self._logger.info(
+                        "Chunk %d complete: %d rows, %.2f MB in %.2fs (insert: %.2fs, commit: %.2fs)",
+                        chunk_index + 1, len(chunk_data), chunk_bytes / (1024 * 1024),
+                        chunk_duration, insert_duration, commit_duration
+                    )
+                    
+                    # Log progress statistics
+                    elapsed_time = time.time() - transfer_start_time
+                    rows_per_second = self._current_row_number / elapsed_time if elapsed_time > 0 else 0
+                    mb_per_second = (total_bytes_transferred / (1024 * 1024)) / elapsed_time if elapsed_time > 0 else 0
+                    
+                    if self._current_row_number % 10000 == 0 or chunk_index % 10 == 0:
+                        self._logger.info(
+                            "Progress: %d/%d rows (%.1f%%), %.2f MB total, "
+                            "%.0f rows/sec, %.2f MB/sec, SQLite size: %s",
+                            self._current_row_number, total_records,
+                            (self._current_row_number / total_records * 100) if total_records > 0 else 0,
+                            total_bytes_transferred / (1024 * 1024),
+                            rows_per_second, mb_per_second,
+                            self._get_file_size_human(self._sqlite_file)
+                        )
+                    
+                except sqlite3.Error as err:
+                    self._logger.error(
+                        "SQLite error inserting chunk %d: %s",
+                        chunk_index + 1, err
+                    )
+                    self._logger.debug("Failed chunk had %d rows", len(chunk_data))
+                    # Try to identify problematic row
+                    if len(chunk_data) > 1:
+                        self._logger.info("Attempting to insert rows individually to identify problem...")
+                        for i, row in enumerate(chunk_data):
+                            try:
+                                self._sqlite_cur.execute(sql, row)
+                            except sqlite3.Error as row_err:
+                                self._logger.error("Failed on row %d: %s", i, row_err)
+                                self._logger.debug("Row data (first 200 chars): %s", str(row)[:200])
+                                raise
+                    raise
                 
                 # Update progress
                 if not self._quiet:
                     progress_bar.update(1)
+                
+                self._last_progress_time = time.time()
+            
+            # Stop progress monitor
+            self._transfer_active = False
+            if self._progress_monitor_thread:
+                self._progress_monitor_thread.join(timeout=1)
             
             progress_bar.close()
             
-        except mysql.connector.Error as err:
-            self._logger.error(
-                "MySQL transfer failed reading table data from table %s: %s",
-                table_name, err
+            # Final statistics
+            total_duration = time.time() - transfer_start_time
+            self._logger.info(
+                "Transfer complete for table '%s': %d rows, %.2f MB in %.2f seconds "
+                "(%.0f rows/sec, %.2f MB/sec)",
+                table_name, self._current_row_number, 
+                total_bytes_transferred / (1024 * 1024), total_duration,
+                self._current_row_number / total_duration if total_duration > 0 else 0,
+                (total_bytes_transferred / (1024 * 1024)) / total_duration if total_duration > 0 else 0
             )
-            raise
-        except sqlite3.Error as err:
+            
+        except Exception as err:
+            self._transfer_active = False
             self._logger.error(
-                "SQLite transfer failed inserting data into table %s: %s",
-                table_name, err
+                "Transfer failed for table '%s' after %d rows: %s",
+                table_name, self._current_row_number, err
             )
+            self._logger.debug("Error traceback: %s", traceback.format_exc())
             raise
 
     def _get_tables_to_transfer(self) -> t.List[str]:
