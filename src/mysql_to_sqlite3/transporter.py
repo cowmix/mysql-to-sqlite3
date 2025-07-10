@@ -874,10 +874,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                     
                     # Process chunk
                     process_start = time.time()
-                    processed_chunk = [
-                        tuple(encode_data_for_sqlite(col) if col is not None else None for col in row)
-                        for row in chunk
-                    ]
+                    processed_chunk = [tuple(row) for row in chunk]
                     process_time = time.time() - process_start
                     
                     total_chunk_time = time.time() - chunk_start_time
@@ -899,6 +896,16 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                     # Save resume state before re-raising
                     self._save_resume_state(table_name, offset, total_records)
                     raise
+
+    def _sanitize_data_for_sqlite(self, chunk_data: t.List[t.Tuple[t.Any, ...]]) -> t.List[t.Tuple[t.Any, ...]]:
+        """Sanitize data before insertion into SQLite to avoid syntax errors."""
+        sanitized_chunk = []
+        for row in chunk_data:
+            sanitized_row = tuple(
+                encode_data_for_sqlite(col) if col is not None else None for col in row
+            )
+            sanitized_chunk.append(sanitized_row)
+        return sanitized_chunk
 
     def _transfer_table_data_with_resume(self, table_name: str, sql: str, total_records: int = 0) -> None:
         """Transfer table data with accurate progress tracking."""
@@ -979,7 +986,9 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                 # Insert chunk into SQLite
                 try:
                     insert_start = time.time()
-                    self._sqlite_cur.executemany(sql, chunk_data)
+                    # Sanitize data before insertion
+                    sanitized_chunk_data = self._sanitize_data_for_sqlite(chunk_data)
+                    self._sqlite_cur.executemany(sql, sanitized_chunk_data)
                     insert_time = time.time() - insert_start
                     
                     commit_start = time.time()

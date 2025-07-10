@@ -39,12 +39,13 @@ def encode_data_for_sqlite(value: t.Any) -> t.Any:
             return value.decode()
         except (UnicodeDecodeError, AttributeError):
             return sqlite3.Binary(value)
-    elif isinstance(value, str):
-        return value
     else:
         try:
-            return sqlite3.Binary(value)
-        except TypeError:
+            # For other types, attempt to encode them as bytes and wrap in sqlite3.Binary
+            # This handles cases where values might be misinterpreted as SQL syntax
+            return sqlite3.Binary(str(value).encode('utf-8', 'surrogatepass'))
+        except (TypeError, ValueError):
+            # If conversion fails, return the value as is
             return value
 
 
