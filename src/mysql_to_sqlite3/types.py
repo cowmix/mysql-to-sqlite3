@@ -37,6 +37,7 @@ class MySQLtoSQLiteParams(tx.TypedDict):
     without_tables: t.Optional[bool]
     without_data: t.Optional[bool]
     without_foreign_keys: t.Optional[bool]
+    optimize_for_blobs: t.Optional[bool]
 
 
 class MySQLtoSQLiteAttributes:
@@ -73,3 +74,4 @@ class MySQLtoSQLiteAttributes:
     _vacuum: bool
     _without_data: bool
     _without_foreign_keys: bool
+    _optimize_for_blobs: bool

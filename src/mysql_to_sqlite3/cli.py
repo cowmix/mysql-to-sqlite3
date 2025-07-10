@@ -171,6 +171,12 @@ _copyright_header: str = f"mysql2sqlite version {package_version} Copyright (c) 
     "can be useful in situations where multiple queries, with small "
     "result sets, need to be combined or computed with each other.",
 )
+@click.option(
+    "--optimize-for-blobs",
+    is_flag=True,
+    help="Enable aggressive SQLite optimizations for tables with large BLOB/TEXT data. "
+         "WARNING: Disables crash safety - database may be corrupted if the process is interrupted.",
+)
 @click.option("-q", "--quiet", is_flag=True, help="Quiet. Display only errors.")
 @click.option("--debug", is_flag=True, help="Debug mode. Will throw exceptions.")
 @click.version_option(message=tabulate(info(), headers=["software", "version"], tablefmt="github"))
@@ -201,6 +207,7 @@ def cli(
     vacuum: bool,
     skip_existing_tables: bool,
     use_buffered_cursors: bool,
+    optimize_for_blobs: bool,
     quiet: bool,
     debug: bool,
 ) -> None:
@@ -316,6 +323,7 @@ def cli(
                 vacuum=vacuum,
                 skip_existing_tables=skip_existing_tables,
                 buffered=use_buffered_cursors,
+                optimize_for_blobs=optimize_for_blobs,
                 log_file=log_file,
                 quiet=quiet,
             )

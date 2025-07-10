@@ -124,6 +124,9 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         self._logger = self._setup_logger(log_file=kwargs.get("log_file") or None, quiet=self._quiet)
 
+        # BLOB optimization flag
+        self._optimize_for_blobs = bool(kwargs.get("optimize_for_blobs", False))
+
         # Resume support
         self._resume_file = f"{self._sqlite_file}.resume"
         self._resume_state = self._load_resume_state()
@@ -163,6 +166,25 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         self._sqlite = sqlite3.connect(realpath(self._sqlite_file), detect_types=sqlite3.PARSE_DECLTYPES)
         self._sqlite.row_factory = sqlite3.Row
+
+        # Apply BLOB optimizations if requested
+        if self._optimize_for_blobs:
+            self._logger.warning(
+                "BLOB optimization mode enabled. WARNING: Database corruption may occur if process is interrupted!"
+            )
+            
+            # Check if database is new/empty for page_size
+            if not exists(self._sqlite_file) or os.path.getsize(self._sqlite_file) == 0:
+                self._sqlite.execute("PRAGMA page_size = 32768")  # Must be before any tables
+                self._logger.debug("Set SQLite page_size to 32KB for BLOB optimization")
+            
+            # These can be set anytime
+            self._sqlite.execute("PRAGMA cache_size = -2000000")  # 2GB cache
+            self._sqlite.execute("PRAGMA temp_store = MEMORY")
+            self._sqlite.execute("PRAGMA mmap_size = 10737418240")  # 10GB memory map
+            self._logger.info(
+                "Applied BLOB optimizations: 2GB cache, memory temp store, 10GB mmap"
+            )
 
         self._sqlite_cur = self._sqlite.cursor()
 
@@ -1149,9 +1171,22 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             self._sqlite_cur.execute("PRAGMA foreign_keys=OFF")
             
             # Optimize SQLite for bulk inserts
-            self._sqlite_cur.execute("PRAGMA synchronous=OFF")
-            self._sqlite_cur.execute("PRAGMA journal_mode=MEMORY")
-            self._sqlite_cur.execute("PRAGMA cache_size=1000000")
+            if self._optimize_for_blobs:
+                # Aggressive optimizations for BLOB data
+                self._sqlite_cur.execute("PRAGMA synchronous=OFF")
+                self._sqlite_cur.execute("PRAGMA journal_mode=OFF")  # No crash safety!
+                self._sqlite_cur.execute("PRAGMA cache_size=-2000000")  # 2GB
+                self._sqlite_cur.execute("PRAGMA temp_store=MEMORY")
+                self._sqlite_cur.execute("PRAGMA mmap_size=10737418240")  # 10GB
+                self._sqlite_cur.execute("PRAGMA wal_autocheckpoint=100000")  # Less frequent
+                self._logger.warning(
+                    "Using aggressive BLOB optimizations - no crash safety!"
+                )
+            else:
+                # Standard optimizations (current behavior)
+                self._sqlite_cur.execute("PRAGMA synchronous=OFF")
+                self._sqlite_cur.execute("PRAGMA journal_mode=MEMORY")
+                self._sqlite_cur.execute("PRAGMA cache_size=1000000")
             
             for table_name in tables:
                 if isinstance(table_name, bytes):
@@ -1226,8 +1261,15 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             raise
         finally:
             # Restore SQLite settings
-            self._sqlite_cur.execute("PRAGMA synchronous=FULL")
-            self._sqlite_cur.execute("PRAGMA journal_mode=DELETE")
+            if self._optimize_for_blobs:
+                # Restore safer settings for BLOB mode
+                self._sqlite_cur.execute("PRAGMA synchronous=NORMAL")  # Safer than FULL
+                self._sqlite_cur.execute("PRAGMA journal_mode=WAL")  # Better than DELETE for large DBs
+            else:
+                # Standard restore
+                self._sqlite_cur.execute("PRAGMA synchronous=FULL")
+                self._sqlite_cur.execute("PRAGMA journal_mode=DELETE")
+            
             self._sqlite_cur.execute("PRAGMA foreign_keys=ON")
 
         if self._vacuum:
