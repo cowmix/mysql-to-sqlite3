@@ -1,4 +1,4 @@
-"""Use to transfer a MySQL database to SQLite."""
+"""Enhanced MySQL to SQLite transporter with stall detection and resume capability."""
 
 import logging
 import os
@@ -7,11 +7,12 @@ import sqlite3
 import typing as t
 import fnmatch
 import time
+import json
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import timedelta, datetime
 from decimal import Decimal
 from math import ceil
-from os.path import realpath
+from os.path import realpath, exists
 from sys import stdout
 from typing import Iterator, List, Tuple, Any
 
@@ -123,8 +124,16 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         self._logger = self._setup_logger(log_file=kwargs.get("log_file") or None, quiet=self._quiet)
 
+        # Resume support
+        self._resume_file = f"{self._sqlite_file}.resume"
+        self._resume_state = self._load_resume_state()
+        
+        # Stall detection
+        self._stall_timeout = 300  # 5 minutes
+        self._last_progress_time = time.time()
+        self._chunk_times = []  # Track chunk processing times
+        
         # MySQL connection configuration for large transfers
-        # FIXED: Removed max_allowed_packet from session variables
         self._mysql_connection_config = {
             'user': self._mysql_user,
             'password': self._mysql_password,
@@ -135,16 +144,14 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             'charset': self._mysql_charset,
             'collation': self._mysql_collation,
             'autocommit': True,
-            'connection_timeout': 300,  # 5 minutes
+            'connection_timeout': 30,  # Reduced to 30 seconds
             'use_unicode': True,
             'sql_mode': 'TRADITIONAL',
-            # Increase timeouts for large transfers (session-level only)
-            # REMOVED max_allowed_packet as it can only be set globally
             'init_command': (
-                "SET SESSION wait_timeout=86400, "
-                "interactive_timeout=86400, "
-                "net_read_timeout=600, "
-                "net_write_timeout=600"
+                "SET SESSION wait_timeout=3600, "  # Reduced to 1 hour
+                "interactive_timeout=3600, "
+                "net_read_timeout=300, "  # 5 minutes
+                "net_write_timeout=300"
             )
         }
 
@@ -165,6 +172,68 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
 
         # Initial MySQL connection
         self._connect_to_mysql()
+
+    def _load_resume_state(self) -> dict:
+        """Load resume state from file."""
+        if exists(self._resume_file):
+            try:
+                with open(self._resume_file, 'r') as f:
+                    state = json.load(f)
+                    self._logger.info(f"Loaded resume state from {self._resume_file}")
+                    return state
+            except Exception as e:
+                self._logger.warning(f"Failed to load resume state: {e}")
+        return {}
+
+    def _save_resume_state(self, table_name: str, offset: int, total_records: int) -> None:
+        """Save resume state to file."""
+        try:
+            state = self._resume_state.copy()
+            state[table_name] = {
+                'offset': offset,
+                'total_records': total_records,
+                'timestamp': datetime.now().isoformat()
+            }
+            with open(self._resume_file, 'w') as f:
+                json.dump(state, f, indent=2)
+            self._logger.debug(f"Saved resume state: table={table_name}, offset={offset}")
+        except Exception as e:
+            self._logger.warning(f"Failed to save resume state: {e}")
+
+    def _clear_resume_state(self, table_name: str) -> None:
+        """Clear resume state for a completed table."""
+        try:
+            if table_name in self._resume_state:
+                del self._resume_state[table_name]
+                with open(self._resume_file, 'w') as f:
+                    json.dump(self._resume_state, f, indent=2)
+                self._logger.debug(f"Cleared resume state for table {table_name}")
+        except Exception as e:
+            self._logger.warning(f"Failed to clear resume state: {e}")
+
+    def _check_stall(self, table_name: str, chunk_num: int) -> bool:
+        """Check if transfer has stalled."""
+        current_time = time.time()
+        time_since_progress = current_time - self._last_progress_time
+        
+        if time_since_progress > self._stall_timeout:
+            self._logger.warning(
+                f"STALL DETECTED: No progress for {time_since_progress:.0f} seconds "
+                f"on table '{table_name}', chunk {chunk_num}"
+            )
+            
+            # Check if processing times are increasing exponentially
+            if len(self._chunk_times) >= 3:
+                recent_times = self._chunk_times[-3:]
+                if recent_times[-1] > recent_times[-2] * 1.5 and recent_times[-2] > recent_times[-3] * 1.5:
+                    self._logger.warning(
+                        "Chunk processing times increasing exponentially: "
+                        f"{recent_times[-3]:.1f}s -> {recent_times[-2]:.1f}s -> {recent_times[-1]:.1f}s"
+                    )
+                    return True
+            
+            return True
+        return False
 
     def _connect_to_mysql(self, is_reconnect: bool = False) -> None:
         """Establish MySQL connection with proper configuration."""
@@ -733,97 +802,267 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             self._logger.error("SQLite failed creating table %s: %s", table_name, err)
             raise
 
-    def _chunked_data_iterator(self, table_name: str, total_records: int) -> Iterator[List[Tuple[Any, ...]]]:
-        """Iterator that yields data chunks with proper connection management."""
+    def _chunked_data_iterator_with_resume(self, table_name: str, total_records: int) -> Iterator[Tuple[int, List[Tuple[Any, ...]]]]:
+        """Iterator that yields data chunks with resume support and offset tracking."""
+        # Check if we're resuming this table
+        start_offset = 0
+        if table_name in self._resume_state:
+            start_offset = self._resume_state[table_name]['offset']
+            self._logger.info(f"Resuming table '{table_name}' from offset {start_offset}")
+        
         if self._chunk_size is None or self._chunk_size <= 0:
-            # Non-chunked: fetch all at once
-            with self._mysql_connection_manager('raw') as cursor:
-                cursor.execute(
-                    "SELECT * FROM `{table_name}` {limit}".format(
-                        table_name=table_name,
-                        limit=f"LIMIT {self._limit_rows}" if self._limit_rows > 0 else "",
-                    )
-                )
-                
-                # Fetch in reasonable chunks to avoid memory issues
-                chunk_size = min(50000, total_records) if total_records > 0 else 50000
-                
-                while True:
-                    chunk = cursor.fetchmany(chunk_size)
-                    if not chunk:
-                        break
-                    yield [
-                        tuple(encode_data_for_sqlite(col) if col is not None else None for col in row)
-                        for row in chunk
-                    ]
-        else:
-            # Chunked transfer using LIMIT/OFFSET
-            offset = 0
+            # Non-chunked mode not supported with resume
+            self._logger.warning("Non-chunked mode doesn't support resume. Using chunk size of 10000.")
+            self._chunk_size = 10000
+        
+        offset = start_offset
+        chunk_num = offset // self._chunk_size
+        
+        while offset < total_records:
+            chunk_start_time = time.time()
             
-            while offset < total_records:
-                with self._mysql_connection_manager('raw') as cursor:
-                    limit_clause = f"LIMIT {self._chunk_size} OFFSET {offset}"
-                    if self._limit_rows > 0:
-                        remaining = min(self._limit_rows - offset, self._chunk_size)
-                        if remaining <= 0:
-                            break
-                        limit_clause = f"LIMIT {remaining} OFFSET {offset}"
-                    
-                    cursor.execute(f"SELECT * FROM `{table_name}` {limit_clause}")
+            with self._mysql_connection_manager('raw') as cursor:
+                limit_clause = f"LIMIT {self._chunk_size} OFFSET {offset}"
+                if self._limit_rows > 0:
+                    remaining = min(self._limit_rows - offset, self._chunk_size)
+                    if remaining <= 0:
+                        break
+                    limit_clause = f"LIMIT {remaining} OFFSET {offset}"
+                
+                query = f"SELECT * FROM `{table_name}` {limit_clause}"
+                self._logger.debug(f"Executing chunk {chunk_num + 1}: {query}")
+                
+                try:
+                    cursor.execute(query)
                     chunk = cursor.fetchall()
                     
                     if not chunk:
                         break
                     
-                    yield [
+                    # Process chunk
+                    processed_chunk = [
                         tuple(encode_data_for_sqlite(col) if col is not None else None for col in row)
                         for row in chunk
                     ]
                     
+                    chunk_time = time.time() - chunk_start_time
+                    self._chunk_times.append(chunk_time)
+                    self._last_progress_time = time.time()
+                    
+                    # Yield offset along with data for resume tracking
+                    yield offset, processed_chunk
+                    
                     offset += len(chunk)
+                    chunk_num += 1
+                    
+                except Exception as e:
+                    self._logger.error(f"Error fetching chunk at offset {offset}: {e}")
+                    # Save resume state before re-raising
+                    self._save_resume_state(table_name, offset, total_records)
+                    raise
 
-    def _transfer_table_data(self, table_name: str, sql: str, total_records: int = 0) -> None:
-        """Transfer table data with robust connection handling."""
+    def _transfer_table_data_with_resume(self, table_name: str, sql: str, total_records: int = 0) -> None:
+        """Transfer table data with resume capability and enhanced progress logging."""
         try:
             if total_records == 0:
                 return
             
             # Calculate progress tracking
-            if self._chunk_size and self._chunk_size > 0:
-                total_chunks = int(ceil(total_records / self._chunk_size))
-                progress_bar = trange(total_chunks, disable=self._quiet, desc=f"Transferring {table_name}")
-            else:
-                progress_bar = trange(1, disable=self._quiet, desc=f"Transferring {table_name}")
+            start_offset = 0
+            if table_name in self._resume_state:
+                start_offset = self._resume_state[table_name]['offset']
             
-            # Process data in chunks
-            for chunk_data in self._chunked_data_iterator(table_name, total_records):
-                if not chunk_data:
-                    break
+            remaining_records = total_records - start_offset
+            total_chunks = int(ceil(total_records / self._chunk_size)) if self._chunk_size else 1
+            
+            # Initial progress message
+            if start_offset > 0:
+                self._logger.info(
+                    f"📂 RESUMING table '{table_name}' from row {start_offset:,} / {total_records:,} "
+                    f"({start_offset/total_records*100:.1f}% already done)"
+                )
+            else:
+                self._logger.info(
+                    f"📊 STARTING table '{table_name}' with {total_records:,} total rows "
+                    f"(chunk size: {self._chunk_size:,} rows)"
+                )
+            
+            progress_bar = trange(
+                total_chunks, 
+                initial=start_offset // self._chunk_size if self._chunk_size else 0,
+                total=int(ceil(total_records / self._chunk_size)) if self._chunk_size else 1,
+                disable=self._quiet, 
+                desc=f"Transferring {table_name}"
+            )
+            
+            # Progress tracking variables
+            self._chunk_times = []
+            chunks_since_reconnect = 0
+            transfer_start_time = time.time()
+            total_bytes_transferred = 0
+            last_log_time = time.time()
+            rows_at_last_log = start_offset
+            
+            # Process data in chunks with resume support
+            for offset, chunk_data in self._chunked_data_iterator_with_resume(table_name, total_records):
+                chunk_num = offset // self._chunk_size + 1
+                chunk_start_time = time.time()
+                
+                # Check for stall
+                if self._check_stall(table_name, chunk_num):
+                    self._logger.warning(
+                        f"⚠️  STALL DETECTED at chunk {chunk_num} (row {offset:,}). "
+                        f"Saving progress and attempting recovery..."
+                    )
+                    self._save_resume_state(table_name, offset, total_records)
+                    
+                    # Log diagnostic info
+                    self._logger.info(
+                        f"📊 Diagnostic: Last {len(self._chunk_times)} chunks took: "
+                        f"{[f'{t:.1f}s' for t in self._chunk_times[-5:]]} "
+                        f"(increasing pattern suggests connection degradation)"
+                    )
+                    
+                    # Force reconnection
+                    self._logger.info("🔄 Forcing MySQL reconnection...")
+                    self._connect_to_mysql(is_reconnect=True)
+                    
+                    # Reset chunk times after reconnection
+                    self._chunk_times = []
+                    chunks_since_reconnect = 0
+                    continue
+                
+                # Calculate chunk size in bytes (approximate)
+                chunk_bytes = sum(
+                    sum(
+                        len(str(col).encode('utf-8')) if col is not None else 0 
+                        for col in row
+                    )
+                    for row in chunk_data
+                )
+                total_bytes_transferred += chunk_bytes
                 
                 # Insert chunk into SQLite
-                self._sqlite_cur.executemany(sql, chunk_data)
-                
-                # Commit periodically to avoid large transactions
-                self._sqlite.commit()
-                
-                # Update progress
-                if not self._quiet:
+                try:
+                    insert_start = time.time()
+                    self._sqlite_cur.executemany(sql, chunk_data)
+                    insert_time = time.time() - insert_start
+                    
+                    commit_start = time.time()
+                    self._sqlite.commit()
+                    commit_time = time.time() - commit_start
+                    
+                    chunk_total_time = time.time() - chunk_start_time
+                    self._chunk_times.append(chunk_total_time)
+                    
+                    # Update counters
+                    chunks_since_reconnect += 1
+                    current_row = offset + len(chunk_data)
+                    
+                    # Log detailed progress every 30 seconds or every 10 chunks
+                    current_time = time.time()
+                    should_log = (
+                        current_time - last_log_time >= 30 or 
+                        chunks_since_reconnect % 10 == 0 or
+                        chunk_total_time > 60  # Always log slow chunks
+                    )
+                    
+                    if should_log:
+                        # Calculate rates
+                        elapsed_total = current_time - transfer_start_time
+                        elapsed_interval = current_time - last_log_time
+                        rows_in_interval = current_row - rows_at_last_log
+                        
+                        overall_rate = current_row / elapsed_total if elapsed_total > 0 else 0
+                        interval_rate = rows_in_interval / elapsed_interval if elapsed_interval > 0 else 0
+                        mb_rate = (total_bytes_transferred / 1024 / 1024) / elapsed_total if elapsed_total > 0 else 0
+                        
+                        # Estimate time remaining
+                        rows_remaining = total_records - current_row
+                        if interval_rate > 0:
+                            eta_seconds = rows_remaining / interval_rate
+                            eta_str = str(timedelta(seconds=int(eta_seconds)))
+                        else:
+                            eta_str = "Unknown"
+                        
+                        # Performance indicator
+                        if len(self._chunk_times) >= 3:
+                            recent_avg = sum(self._chunk_times[-3:]) / 3
+                            older_avg = sum(self._chunk_times[-6:-3]) / 3 if len(self._chunk_times) >= 6 else recent_avg
+                            if recent_avg > older_avg * 1.2:
+                                perf_indicator = "🔴 SLOWING"
+                            elif recent_avg < older_avg * 0.8:
+                                perf_indicator = "🟢 SPEEDING UP"
+                            else:
+                                perf_indicator = "🟡 STABLE"
+                        else:
+                            perf_indicator = "🔵 WARMING UP"
+                        
+                        self._logger.info(
+                            f"📈 PROGRESS: {current_row:,} / {total_records:,} rows "
+                            f"({current_row/total_records*100:.1f}%) | "
+                            f"Chunk {chunk_num} took {chunk_total_time:.1f}s "
+                            f"(insert: {insert_time:.1f}s, commit: {commit_time:.1f}s) | "
+                            f"Rate: {interval_rate:.0f} rows/s | "
+                            f"Transfer: {total_bytes_transferred/1024/1024:.1f} MB @ {mb_rate:.1f} MB/s | "
+                            f"ETA: {eta_str} | {perf_indicator}"
+                        )
+                        
+                        # Update tracking
+                        last_log_time = current_time
+                        rows_at_last_log = current_row
+                    
+                    # Save resume state periodically
+                    if chunks_since_reconnect % 10 == 0:
+                        self._save_resume_state(table_name, current_row, total_records)
+                        self._logger.debug(f"💾 Saved resume checkpoint at row {current_row:,}")
+                    
+                    # Warn about very slow chunks
+                    if chunk_total_time > 120:
+                        self._logger.warning(
+                            f"⚠️  SLOW CHUNK: Chunk {chunk_num} took {chunk_total_time:.1f}s "
+                            f"({len(chunk_data)} rows, {chunk_bytes/1024/1024:.1f} MB). "
+                            f"Consider reducing chunk size."
+                        )
+                    
+                    # Update progress bar
                     progress_bar.update(1)
+                    
+                except sqlite3.Error as err:
+                    self._logger.error(
+                        f"❌ SQLite error at chunk {chunk_num} (offset {offset:,}): {err}"
+                    )
+                    self._save_resume_state(table_name, offset, total_records)
+                    raise
             
             progress_bar.close()
             
-        except mysql.connector.Error as err:
-            self._logger.error(
-                "MySQL transfer failed reading table data from table %s: %s",
-                table_name, err
+            # Final summary
+            total_time = time.time() - transfer_start_time
+            self._logger.info(
+                f"✅ COMPLETED table '{table_name}': {total_records:,} rows, "
+                f"{total_bytes_transferred/1024/1024:.1f} MB in {str(timedelta(seconds=int(total_time)))} "
+                f"({total_records/total_time:.0f} rows/s average)"
             )
-            raise
-        except sqlite3.Error as err:
-            self._logger.error(
-                "SQLite transfer failed inserting data into table %s: %s",
-                table_name, err
+            
+            # Clear resume state for completed table
+            self._clear_resume_state(table_name)
+            
+        except KeyboardInterrupt:
+            current_row = offset if 'offset' in locals() else start_offset
+            self._logger.warning(
+                f"⚠️  INTERRUPTED at row {current_row:,} / {total_records:,} "
+                f"({current_row/total_records*100:.1f}%). Progress saved - run again to resume."
             )
+            self._save_resume_state(table_name, current_row, total_records)
             raise
+        except Exception as err:
+            self._logger.error(f"❌ Transfer failed for table '{table_name}': {err}")
+            raise
+
+    def _transfer_table_data(self, table_name: str, sql: str, total_records: int = 0) -> None:
+        """Wrapper to use resume-capable transfer."""
+        self._transfer_table_data_with_resume(table_name, sql, total_records)
 
     def _get_tables_to_transfer(self) -> t.List[str]:
         """Get the list of tables to transfer based on configured filters."""
@@ -888,7 +1127,10 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                 if isinstance(table_name, bytes):
                     table_name = table_name.decode()
 
-                if self._skip_existing_tables:
+                # Check if table is already completed (not in resume state)
+                if table_name in self._resume_state:
+                    self._logger.info(f"Resuming incomplete transfer for table: {table_name}")
+                elif self._skip_existing_tables:
                     self._sqlite_cur.execute(
                         "SELECT name FROM sqlite_master WHERE type='table' AND name=?", 
                         (table_name,)
@@ -905,7 +1147,13 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                 )
 
                 if not self._without_tables:
-                    self._create_table(table_name)
+                    # Check if table exists (for resume case)
+                    self._sqlite_cur.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", 
+                        (table_name,)
+                    )
+                    if not self._sqlite_cur.fetchone():
+                        self._create_table(table_name)
 
                 if not self._without_data:
                     # Get total record count
@@ -957,6 +1205,14 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             self._sqlite_cur.execute("VACUUM")
 
         self._logger.info("Done!")
+        
+        # Clean up resume file if all tables completed
+        if exists(self._resume_file) and not self._resume_state:
+            try:
+                os.remove(self._resume_file)
+                self._logger.info(f"Removed resume file: {self._resume_file}")
+            except:
+                pass
 
         if self._mysql.is_connected():
             self._mysql.close()
