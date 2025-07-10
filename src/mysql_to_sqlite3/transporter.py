@@ -1258,7 +1258,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                             VALUES ({placeholders})
                         '''.format(
                             table=table_name,
-                            fields=('"{}"'.format(col) for col in columns),
+                            fields=", ".join('"{}"'.format(col) for col in columns),
                             placeholders=("?, " * len(columns)).rstrip(" ,"),
                         )
                         
