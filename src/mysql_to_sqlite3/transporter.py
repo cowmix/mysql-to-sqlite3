@@ -803,7 +803,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             raise
 
     def _chunked_data_iterator_with_resume(self, table_name: str, total_records: int) -> Iterator[Tuple[int, List[Tuple[Any, ...]]]]:
-        """Iterator that yields data chunks with resume support and offset tracking."""
+        """Iterator that yields data chunks with resume support and timing info."""
         # Check if we're resuming this table
         start_offset = 0
         if table_name in self._resume_state:
@@ -833,24 +833,37 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                 self._logger.debug(f"Executing chunk {chunk_num + 1}: {query}")
                 
                 try:
+                    # Time the query execution
+                    query_start = time.time()
                     cursor.execute(query)
+                    query_time = time.time() - query_start
+                    
+                    # Time the fetch
+                    fetch_start = time.time()
                     chunk = cursor.fetchall()
+                    fetch_time = time.time() - fetch_start
                     
                     if not chunk:
                         break
                     
                     # Process chunk
+                    process_start = time.time()
                     processed_chunk = [
                         tuple(encode_data_for_sqlite(col) if col is not None else None for col in row)
                         for row in chunk
                     ]
+                    process_time = time.time() - process_start
                     
-                    chunk_time = time.time() - chunk_start_time
-                    self._chunk_times.append(chunk_time)
-                    self._last_progress_time = time.time()
+                    total_chunk_time = time.time() - chunk_start_time
                     
-                    # Yield offset along with data for resume tracking
-                    yield offset, processed_chunk
+                    # Return timing info along with data
+                    yield offset, processed_chunk, {
+                        'query_time': query_time,
+                        'fetch_time': fetch_time,
+                        'process_time': process_time,
+                        'total_time': total_chunk_time,
+                        'rows': len(chunk)
+                    }
                     
                     offset += len(chunk)
                     chunk_num += 1
@@ -862,7 +875,7 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                     raise
 
     def _transfer_table_data_with_resume(self, table_name: str, sql: str, total_records: int = 0) -> None:
-        """Transfer table data with resume capability and enhanced progress logging."""
+        """Transfer table data with accurate progress tracking."""
         try:
             if total_records == 0:
                 return
@@ -901,27 +914,20 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             transfer_start_time = time.time()
             total_bytes_transferred = 0
             last_log_time = time.time()
-            rows_at_last_log = start_offset
+            rows_at_start = start_offset
+            last_progress_rows = start_offset
             
             # Process data in chunks with resume support
-            for offset, chunk_data in self._chunked_data_iterator_with_resume(table_name, total_records):
+            for offset, chunk_data, timing_info in self._chunked_data_iterator_with_resume(table_name, total_records):
                 chunk_num = offset // self._chunk_size + 1
-                chunk_start_time = time.time()
                 
-                # Check for stall
-                if self._check_stall(table_name, chunk_num):
+                # Check for stall based on fetch time
+                if timing_info['fetch_time'] > self._stall_timeout:
                     self._logger.warning(
-                        f"⚠️  STALL DETECTED at chunk {chunk_num} (row {offset:,}). "
-                        f"Saving progress and attempting recovery..."
+                        f"⚠️  STALL DETECTED: Chunk {chunk_num} fetch took {timing_info['fetch_time']:.1f}s "
+                        f"(threshold: {self._stall_timeout}s). Saving progress and reconnecting..."
                     )
                     self._save_resume_state(table_name, offset, total_records)
-                    
-                    # Log diagnostic info
-                    self._logger.info(
-                        f"📊 Diagnostic: Last {len(self._chunk_times)} chunks took: "
-                        f"{[f'{t:.1f}s' for t in self._chunk_times[-5:]]} "
-                        f"(increasing pattern suggests connection degradation)"
-                    )
                     
                     # Force reconnection
                     self._logger.info("🔄 Forcing MySQL reconnection...")
@@ -932,14 +938,16 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                     chunks_since_reconnect = 0
                     continue
                 
-                # Calculate chunk size in bytes (approximate)
-                chunk_bytes = sum(
-                    sum(
-                        len(str(col).encode('utf-8')) if col is not None else 0 
-                        for col in row
-                    )
-                    for row in chunk_data
-                )
+                # Calculate chunk size in bytes (more accurate)
+                chunk_bytes = 0
+                for row in chunk_data:
+                    for col in row:
+                        if col is not None:
+                            if isinstance(col, (bytes, bytearray)):
+                                chunk_bytes += len(col)
+                            else:
+                                chunk_bytes += len(str(col).encode('utf-8'))
+                
                 total_bytes_transferred += chunk_bytes
                 
                 # Insert chunk into SQLite
@@ -952,8 +960,9 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                     self._sqlite.commit()
                     commit_time = time.time() - commit_start
                     
-                    chunk_total_time = time.time() - chunk_start_time
-                    self._chunk_times.append(chunk_total_time)
+                    # Total time for this chunk
+                    total_chunk_time = timing_info['total_time'] + insert_time + commit_time
+                    self._chunk_times.append(total_chunk_time)
                     
                     # Update counters
                     chunks_since_reconnect += 1
@@ -964,20 +973,25 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                     should_log = (
                         current_time - last_log_time >= 30 or 
                         chunks_since_reconnect % 10 == 0 or
-                        chunk_total_time > 60  # Always log slow chunks
+                        total_chunk_time > 60  # Always log slow chunks
                     )
                     
                     if should_log:
                         # Calculate rates
                         elapsed_total = current_time - transfer_start_time
                         elapsed_interval = current_time - last_log_time
-                        rows_in_interval = current_row - rows_at_last_log
+                        rows_in_interval = current_row - last_progress_rows
                         
-                        overall_rate = current_row / elapsed_total if elapsed_total > 0 else 0
-                        interval_rate = rows_in_interval / elapsed_interval if elapsed_interval > 0 else 0
-                        mb_rate = (total_bytes_transferred / 1024 / 1024) / elapsed_total if elapsed_total > 0 else 0
+                        # Overall rate from start
+                        overall_rate = (current_row - rows_at_start) / elapsed_total if elapsed_total > 0 else 0
+                        # Interval rate (more accurate for current speed)
+                        interval_rate = rows_in_interval / elapsed_interval if elapsed_interval > 0 and rows_in_interval > 0 else overall_rate
                         
-                        # Estimate time remaining
+                        # Data rate
+                        mb_transferred = total_bytes_transferred / 1024 / 1024
+                        mb_rate = mb_transferred / elapsed_total if elapsed_total > 0 else 0
+                        
+                        # Estimate time remaining based on recent rate
                         rows_remaining = total_records - current_row
                         if interval_rate > 0:
                             eta_seconds = rows_remaining / interval_rate
@@ -985,32 +999,44 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                         else:
                             eta_str = "Unknown"
                         
-                        # Performance indicator
+                        # Performance indicator based on chunk times
                         if len(self._chunk_times) >= 3:
                             recent_avg = sum(self._chunk_times[-3:]) / 3
-                            older_avg = sum(self._chunk_times[-6:-3]) / 3 if len(self._chunk_times) >= 6 else recent_avg
-                            if recent_avg > older_avg * 1.2:
-                                perf_indicator = "🔴 SLOWING"
-                            elif recent_avg < older_avg * 0.8:
-                                perf_indicator = "🟢 SPEEDING UP"
+                            if len(self._chunk_times) >= 6:
+                                older_avg = sum(self._chunk_times[-6:-3]) / 3
+                                if recent_avg > older_avg * 1.5:
+                                    perf_indicator = "🔴 SLOWING"
+                                elif recent_avg > older_avg * 1.2:
+                                    perf_indicator = "🟡 DEGRADING"
+                                elif recent_avg < older_avg * 0.8:
+                                    perf_indicator = "🟢 IMPROVING"
+                                else:
+                                    perf_indicator = "🟡 STABLE"
                             else:
-                                perf_indicator = "🟡 STABLE"
+                                perf_indicator = "🔵 WARMING UP"
                         else:
-                            perf_indicator = "🔵 WARMING UP"
+                            perf_indicator = "🔵 STARTING"
+                        
+                        # Detailed timing breakdown for last chunk
+                        timing_breakdown = (
+                            f"fetch: {timing_info['fetch_time']:.1f}s, "
+                            f"process: {timing_info['process_time']:.1f}s, "
+                            f"insert: {insert_time:.1f}s, "
+                            f"commit: {commit_time:.1f}s"
+                        )
                         
                         self._logger.info(
                             f"📈 PROGRESS: {current_row:,} / {total_records:,} rows "
                             f"({current_row/total_records*100:.1f}%) | "
-                            f"Chunk {chunk_num} took {chunk_total_time:.1f}s "
-                            f"(insert: {insert_time:.1f}s, commit: {commit_time:.1f}s) | "
-                            f"Rate: {interval_rate:.0f} rows/s | "
-                            f"Transfer: {total_bytes_transferred/1024/1024:.1f} MB @ {mb_rate:.1f} MB/s | "
+                            f"Chunk {chunk_num} took {total_chunk_time:.1f}s ({timing_breakdown}) | "
+                            f"Speed: {interval_rate:.0f} rows/s, {mb_rate:.1f} MB/s | "
+                            f"Total: {mb_transferred:.1f} MB | "
                             f"ETA: {eta_str} | {perf_indicator}"
                         )
                         
                         # Update tracking
                         last_log_time = current_time
-                        rows_at_last_log = current_row
+                        last_progress_rows = current_row
                     
                     # Save resume state periodically
                     if chunks_since_reconnect % 10 == 0:
@@ -1018,15 +1044,16 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
                         self._logger.debug(f"💾 Saved resume checkpoint at row {current_row:,}")
                     
                     # Warn about very slow chunks
-                    if chunk_total_time > 120:
+                    if total_chunk_time > 120:
                         self._logger.warning(
-                            f"⚠️  SLOW CHUNK: Chunk {chunk_num} took {chunk_total_time:.1f}s "
-                            f"({len(chunk_data)} rows, {chunk_bytes/1024/1024:.1f} MB). "
-                            f"Consider reducing chunk size."
+                            f"⚠️  SLOW CHUNK: Chunk {chunk_num} took {total_chunk_time:.1f}s total "
+                            f"(fetch: {timing_info['fetch_time']:.1f}s for {chunk_bytes/1024/1024:.1f} MB). "
+                            f"Consider reducing chunk size or checking network/server load."
                         )
                     
                     # Update progress bar
                     progress_bar.update(1)
+                    self._last_progress_time = time.time()
                     
                 except sqlite3.Error as err:
                     self._logger.error(
@@ -1039,10 +1066,13 @@ class MySQLtoSQLite(MySQLtoSQLiteAttributes):
             
             # Final summary
             total_time = time.time() - transfer_start_time
+            total_mb = total_bytes_transferred / 1024 / 1024
+            rows_transferred = total_records - rows_at_start
+            
             self._logger.info(
-                f"✅ COMPLETED table '{table_name}': {total_records:,} rows, "
-                f"{total_bytes_transferred/1024/1024:.1f} MB in {str(timedelta(seconds=int(total_time)))} "
-                f"({total_records/total_time:.0f} rows/s average)"
+                f"✅ COMPLETED table '{table_name}': {rows_transferred:,} rows, "
+                f"{total_mb:.1f} MB in {str(timedelta(seconds=int(total_time)))} "
+                f"({rows_transferred/total_time:.0f} rows/s, {total_mb/total_time:.1f} MB/s average)"
             )
             
             # Clear resume state for completed table
